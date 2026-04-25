@@ -29,7 +29,12 @@ const connect = (wsUrl) => {
         try { socket.close(); } catch (e) {}
     }
 
-    socket = new WebSocket(wsUrl);
+    try {
+        socket = new WebSocket(wsUrl);
+    } catch (err) {
+        postMessage({ type: 'error', message: err.message || 'Invalid WebSocket URL' });
+        return;
+    }
     socket.binaryType = 'arraybuffer';
 
     socket.onopen = () => {

@@ -274,6 +274,16 @@ class HomegamesClient {
         this.rendering = false;
         this.currentBuf = null;
 
+        // Clear stale state from previous session
+        if (this.renderer) {
+            this.renderer.stopAllSounds();
+            this.renderer.thingIndices = [];
+        }
+        if (this.assetManager) {
+            this.assetManager.assets = {};
+            this.assetManager.imageCache = {};
+        }
+
         if (this.worker) {
             this.worker.postMessage({ type: 'connect', wsUrl: newWsUrl });
         } else {

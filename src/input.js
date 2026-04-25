@@ -130,17 +130,23 @@ class InputHandler {
             this.send(JSON.stringify({ type: 'keydown', key: k }));
         });
 
-        // Poll gamepads
+        // Poll gamepads (throttled — only send when state changes)
         if (this._homepad) {
             try {
                 const gamepads = this._homepad.getGamepads();
                 if (gamepads && gamepads.length) {
                     gamepads.forEach((gp) => {
-                        this.send(JSON.stringify({
-                            type: 'input',
-                            gamepad: true,
-                            input: this._homepad.getGamepadState(gp.index),
-                        }));
+                        const state = this._homepad.getGamepadState(gp.index);
+                        const stateStr = JSON.stringify(state);
+                        if (!this._lastGamepadState || this._lastGamepadState[gp.index] !== stateStr) {
+                            if (!this._lastGamepadState) this._lastGamepadState = {};
+                            this._lastGamepadState[gp.index] = stateStr;
+                            this.send(JSON.stringify({
+                                type: 'input',
+                                gamepad: true,
+                                input: state,
+                            }));
+                        }
                     });
                 }
             } catch (e) { /* ignore gamepad errors */ }
@@ -205,7 +211,9 @@ class InputHandler {
                 inputEl.type = 'file';
                 inputEl.style.display = 'none';
                 document.body.appendChild(inputEl);
-                inputEl.click();
+                const cleanupInput = () => {
+                    if (inputEl.parentNode) document.body.removeChild(inputEl);
+                };
                 inputEl.onchange = () => {
                     if (inputEl.files.length > 0) {
                         const fileReader = new FileReader();
@@ -218,8 +226,11 @@ class InputHandler {
                         };
                         fileReader.readAsArrayBuffer(inputEl.files[0]);
                     }
-                    document.body.removeChild(inputEl);
+                    cleanupInput();
                 };
+                // Clean up if user cancels the file dialog
+                inputEl.addEventListener('cancel', cleanupInput);
+                inputEl.click();
             }
         } else {
             const x = this.mousePos[0];
