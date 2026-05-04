@@ -1,7 +1,7 @@
 {
   "name": "homegames-client",
   "version": "0.1.0",
-  "description": "Embeddable browser client for Homegames — renders game sessions to any DOM container",
+  "description": "Embeddable browser client for Homegames",
   "main": "src/index.js",
   "browser": "dist/homegames-client.js",
   "scripts": {
