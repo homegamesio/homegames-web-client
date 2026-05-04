@@ -17,8 +17,11 @@ const squishMap = {
     '120': require('squish-120'),
     '130': require('squish-130'),
     '135': require('squish-135'),
+    '136': require('squish-136'),
+    '137': require('squish-137'),
+    '138': require('squish-138'),
 };
 
-const DEFAULT_VERSION = '135';
+const DEFAULT_VERSION = '138';
 
 module.exports = { squishMap, DEFAULT_VERSION };

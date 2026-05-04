@@ -82,6 +82,12 @@ class InputHandler {
             this.assetManager.unlockAudio();
             if (this._keyMatters(e) && !this.keysDown['Meta']) {
                 e.preventDefault();
+                // If there's a pending keyup debounce for this key, cancel it —
+                // the key is still physically held (macOS accent popup pattern).
+                if (this._keyUpTimers && this._keyUpTimers[e.key]) {
+                    clearTimeout(this._keyUpTimers[e.key]);
+                    delete this._keyUpTimers[e.key];
+                }
                 this.send(JSON.stringify({ type: 'keydown', key: e.key }));
                 this.keysDown[e.key] = true;
             }
@@ -90,8 +96,17 @@ class InputHandler {
         h.keyup = (e) => {
             if (this._keyMatters(e)) {
                 e.preventDefault();
-                this.send(JSON.stringify({ type: 'keyup', key: e.key }));
-                this.keysDown[e.key] = false;
+                // Debounce keyup: on macOS, holding a key triggers a synthetic
+                // keyup after ~1s (accent popup), immediately followed by keydown
+                // if the key is still held. Delay clearing keysDown so the
+                // rAF-based key repeat in tick() keeps sending during the gap.
+                if (!this._keyUpTimers) this._keyUpTimers = {};
+                if (this._keyUpTimers[e.key]) clearTimeout(this._keyUpTimers[e.key]);
+                this._keyUpTimers[e.key] = setTimeout(() => {
+                    this.keysDown[e.key] = false;
+                    delete this._keyUpTimers[e.key];
+                    this.send(JSON.stringify({ type: 'keyup', key: e.key }));
+                }, 50);
             }
         };
 
