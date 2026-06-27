@@ -8,6 +8,16 @@ class AssetManager {
         this.assets = {};       // key -> { type, data, decoded }
         this.imageCache = {};   // key -> Image element or 'loading'
         this.audioCtx = null;
+        // Optional callback invoked when an asset finishes loading
+        // asynchronously (image decode, font load, audio decode). The client
+        // uses this to repaint the current frame — otherwise a frame that
+        // referenced a not-yet-loaded asset would render empty and stay that
+        // way until the next state update arrives.
+        this.onAssetReady = null;
+    }
+
+    _notifyReady() {
+        if (typeof this.onAssetReady === 'function') this.onAssetReady();
     }
 
     /**
@@ -27,6 +37,7 @@ class AssetManager {
                 this.audioCtx.decodeAudioData(this.assets[key].data, (buffer) => {
                     this.assets[key].data = buffer;
                     this.assets[key].decoded = true;
+                    this._notifyReady();
                 });
             }
         }
@@ -64,6 +75,7 @@ class AssetManager {
                 if (this.audioCtx) {
                     this.audioCtx.decodeAudioData(payloadData.buffer, (buffer) => {
                         this.assets[payloadKey] = { type: 'audio', data: buffer, decoded: true };
+                        this._notifyReady();
                     }, (err) => {
                         console.warn('Unable to decode audio:', err);
                     });
@@ -78,6 +90,7 @@ class AssetManager {
                     font.load().then((loadedFont) => {
                         document.fonts.add(loadedFont);
                         this.assets[payloadKey] = { type: 'font', data: loadedFont, name: payloadKey };
+                        this._notifyReady();
                     });
                 }
             }
@@ -100,6 +113,7 @@ class AssetManager {
             this.imageCache[assetKey] = 'loading';
             image.onload = () => {
                 this.imageCache[assetKey] = image;
+                this._notifyReady();
             };
             image.src = this.assets[assetKey].data;
         }

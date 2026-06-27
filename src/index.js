@@ -60,6 +60,11 @@ class HomegamesClient {
 
         this.currentBuf = null;
         this.rendering = false;
+        // Only re-unsquish + redraw when something actually changed (new state
+        // buffer, resize, or aspect-ratio change). Avoids burning a full frame
+        // decode + canvas repaint 60x/sec while the game is idle.
+        console.log('this really happens lol');
+        this._frameDirty = false;
         this._rafId = null;
         this._resizeHandler = null;
     }
@@ -87,6 +92,9 @@ class HomegamesClient {
 
         // --- Set up subsystems ---
         this.assetManager = new AssetManager();
+        // When an asset finishes loading async (image/font/audio), repaint the
+        // current frame — it may have rendered before the asset was ready.
+        this.assetManager.onAssetReady = () => { this._frameDirty = true; };
         this.renderer = new Renderer(this.canvas, this.assetManager);
         this.inputHandler = new InputHandler(
             this.canvas,
@@ -315,6 +323,7 @@ class HomegamesClient {
 
             case 3: // Game state frame
                 this.currentBuf = buf;
+                this._frameDirty = true;
                 if (!this.rendering) {
                     this.rendering = true;
                     this._renderLoop();
@@ -411,6 +420,9 @@ class HomegamesClient {
             this.inputHandler.clientWidth = clientWidth;
             this.inputHandler.clientHeight = clientHeight;
         }
+
+        // Resizing clears the canvas, so the current frame must be repainted.
+        this._frameDirty = true;
     }
 
     _renderLoop() {
@@ -421,9 +433,11 @@ class HomegamesClient {
             this.inputHandler.tick();
         }
 
-        // Render current frame
-        if (this.currentBuf && this.currentBuf.length > 1 && this.currentBuf[0] === 3 && this.unsquish) {
+        // Render current frame — only when something changed since the last paint.
+        // The input tick above still runs every frame (hover, gamepad polling).
+        if (this._frameDirty && this.currentBuf && this.currentBuf.length > 1 && this.currentBuf[0] === 3 && this.unsquish) {
             this.renderer.renderFrame(this.currentBuf, this.unsquish);
+            this._frameDirty = false;
         }
 
         this._rafId = requestAnimationFrame(() => this._renderLoop());
