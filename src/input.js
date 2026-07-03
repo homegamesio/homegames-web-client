@@ -19,6 +19,8 @@ class InputHandler {
         this.mouseDown = false;
         this.mousePos = null;
         this.keysDown = {};
+        this._lastKeyRepeat = {};        // per-key timestamp of last sent keydown
+        this._keyRepeatIntervalMs = 33;  // ~30 repeats/sec, decoupled from frame rate
         this.currentHover = null;
         this.clickStopper = null;
         this.spectating = false;
@@ -54,10 +56,21 @@ class InputHandler {
             const rect = this.canvas.getBoundingClientRect();
             const clickX = (this.mousePos[0] - rect.left) / rect.width * 100;
             const clickY = (this.mousePos[1] - rect.top) / rect.height * 100;
-            this.send(JSON.stringify({ type: 'mouseup', data: { x: clickX, y: clickY } }));
+            // Only forward releases that land on the canvas — off-canvas releases
+            // would send out-of-range coords (the click path is bounded the same way).
+            if (clickX >= 0 && clickX <= 100 && clickY >= 0 && clickY <= 100) {
+                this.send(JSON.stringify({ type: 'mouseup', data: { x: clickX, y: clickY } }));
+            }
         };
 
         h.mousemove = (e) => {
+            // If we think the button is down but nothing is actually pressed,
+            // the mouseup happened outside the window where our listener can't
+            // fire. Clear the stale state so we don't fire phantom clicks when
+            // the pointer re-enters the canvas.
+            if (this.mouseDown && e.buttons === 0) {
+                this.mouseDown = false;
+            }
             this.mousePos = [e.clientX + window.scrollX, e.clientY + window.scrollY];
         };
 
@@ -88,7 +101,14 @@ class InputHandler {
                     clearTimeout(this._keyUpTimers[e.key]);
                     delete this._keyUpTimers[e.key];
                 }
-                this.send(JSON.stringify({ type: 'keydown', key: e.key }));
+                // Only emit on the initial press. OS auto-repeat fires keydown
+                // many times/sec; those are ignored here, and tick() emits
+                // repeats at a fixed cadence so we don't flood the server's
+                // input rate limiter.
+                if (!this.keysDown[e.key]) {
+                    this.send(JSON.stringify({ type: 'keydown', key: e.key }));
+                    this._lastKeyRepeat[e.key] = Date.now();
+                }
                 this.keysDown[e.key] = true;
             }
         };
@@ -110,9 +130,16 @@ class InputHandler {
             }
         };
 
+        h.blur = () => {
+            // Window lost focus (alt-tab, switched app) while the button was
+            // held — we won't get the mouseup, so clear the held state.
+            this.mouseDown = false;
+        };
+
         window.addEventListener('mousedown', h.mousedown);
         window.addEventListener('mouseup', h.mouseup);
         window.addEventListener('mousemove', h.mousemove);
+        window.addEventListener('blur', h.blur);
         window.addEventListener('touchstart', h.touchstart, { passive: false });
         this.canvas.addEventListener('touchmove', h.touchmove, { passive: false });
         window.addEventListener('touchend', h.touchend);
@@ -128,6 +155,7 @@ class InputHandler {
         window.removeEventListener('mousedown', h.mousedown);
         window.removeEventListener('mouseup', h.mouseup);
         window.removeEventListener('mousemove', h.mousemove);
+        window.removeEventListener('blur', h.blur);
         window.removeEventListener('touchstart', h.touchstart);
         this.canvas.removeEventListener('touchmove', h.touchmove);
         window.removeEventListener('touchend', h.touchend);
@@ -140,9 +168,15 @@ class InputHandler {
      * handles held keys, and performs click/hover logic.
      */
     tick() {
-        // Repeat held keys
+        // Repeat held keys at a fixed cadence, decoupled from the rAF frame
+        // rate (which can be 120Hz+ on high-refresh displays and would otherwise
+        // blow the server's input rate limit).
+        const nowTs = Date.now();
         Object.keys(this.keysDown).filter(k => this.keysDown[k]).forEach(k => {
-            this.send(JSON.stringify({ type: 'keydown', key: k }));
+            if (nowTs - (this._lastKeyRepeat[k] || 0) >= this._keyRepeatIntervalMs) {
+                this.send(JSON.stringify({ type: 'keydown', key: k }));
+                this._lastKeyRepeat[k] = nowTs;
+            }
         });
 
         // Poll gamepads (throttled — only send when state changes)

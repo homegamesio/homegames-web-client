@@ -145,7 +145,36 @@ class Renderer {
                             ctx.shadowColor = 'rgba(' + sc[0] + ',' + sc[1] + ',' + sc[2] + ',' + sc[3] + ')';
                             if (thing.effects.shadow.blur) ctx.shadowBlur = thing.effects.shadow.blur;
                         }
-                        ctx.drawImage(image, (asset.pos.x / 100) * canvas.width, (asset.pos.y / 100) * canvas.height, image.width, image.height);
+
+                        const dx = (asset.pos.x / 100) * canvas.width;
+                        const dy = (asset.pos.y / 100) * canvas.height;
+
+                        // Crop: percentages (0-100) of the source image removed
+                        // from each edge. Absent on nodes from older squish
+                        // versions, so default to 0 (no crop).
+                        let cropLeft = asset.cropLeft || 0;
+                        let cropTop = asset.cropTop || 0;
+                        let cropRight = asset.cropRight || 0;
+                        let cropBottom = asset.cropBottom || 0;
+
+                        // A source rect with zero/negative width or height makes
+                        // drawImage throw — ignore insets that would collapse it.
+                        if (cropLeft + cropRight >= 100) { cropLeft = 0; cropRight = 0; }
+                        if (cropTop + cropBottom >= 100) { cropTop = 0; cropBottom = 0; }
+
+                        if (cropLeft || cropTop || cropRight || cropBottom) {
+                            // Source sub-rectangle in the image's natural pixel
+                            // space. naturalWidth/Height are the true decoded
+                            // dimensions (image.width/height above were mutated
+                            // to destination size).
+                            const sx = (cropLeft / 100) * image.naturalWidth;
+                            const sy = (cropTop / 100) * image.naturalHeight;
+                            const sWidth = (1 - (cropLeft + cropRight) / 100) * image.naturalWidth;
+                            const sHeight = (1 - (cropTop + cropBottom) / 100) * image.naturalHeight;
+                            ctx.drawImage(image, sx, sy, sWidth, sHeight, dx, dy, image.width, image.height);
+                        } else {
+                            ctx.drawImage(image, dx, dy, image.width, image.height);
+                        }
                     }
                 }
             }

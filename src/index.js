@@ -63,7 +63,7 @@ class HomegamesClient {
         // Only re-unsquish + redraw when something actually changed (new state
         // buffer, resize, or aspect-ratio change). Avoids burning a full frame
         // decode + canvas repaint 60x/sec while the game is idle.
-        console.log('this really happens lol');
+        console.log('this really happens lollll');
         this._frameDirty = false;
         this._rafId = null;
         this._resizeHandler = null;

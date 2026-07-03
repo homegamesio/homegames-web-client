@@ -1,27 +1,12 @@
-// Map of squish version strings to their npm packages.
-// The server tells us which version to use in the init message.
+// Squish version → module map.
+// The canonical version list lives in homegames-common (game-loader.js);
+// the squish packages themselves are installed via the homegames-common
+// dependency. Requires must stay static so webpack can bundle them.
 
 const squishMap = {
-    '0756': require('squish-0756'),
-    '0762': require('squish-0762'),
-    '0765': require('squish-0765'),
-    '0766': require('squish-0766'),
-    '0767': require('squish-0767'),
-    '1000': require('squish-1000'),
-    '1004': require('squish-1004'),
-    '1005': require('squish-1005'),
-    '1006': require('squish-1006'),
-    '1007': require('squish-1007'),
-    '1009': require('squish-1009'),
-    '1010': require('squish-1010'),
-    '120': require('squish-120'),
-    '130': require('squish-130'),
-    '135': require('squish-135'),
-    '136': require('squish-136'),
-    '137': require('squish-137'),
-    '138': require('squish-138'),
+    '142': require('squish-142')
 };
 
-const DEFAULT_VERSION = '138';
+const DEFAULT_VERSION = '142';
 
 module.exports = { squishMap, DEFAULT_VERSION };
