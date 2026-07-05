@@ -235,7 +235,7 @@ class InputHandler {
     _keyMatters(event) {
         return (event.key.length === 1 && event.key >= ' ' && event.key <= 'z') ||
             (event.keyCode >= 36 && event.keyCode <= 40) ||
-            event.key === 'Meta' || event.key === 'Backspace';
+            event.key === 'Meta' || event.key === 'Backspace' || event.key === 'Enter';
     }
 
     _onHover(nodeId) {
