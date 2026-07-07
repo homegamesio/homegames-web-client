@@ -1,4 +1,5 @@
 const path = require('path');
+const webpack = require('webpack');
 
 module.exports = {
     entry: path.join(__dirname, 'src', 'index.js'),
@@ -22,5 +23,12 @@ module.exports = {
             "fs": false,
         }
     },
+    plugins: [
+        // The squish Squisher (used by LocalSession) builds asset bundles with
+        // Buffer, which browsers don't have.
+        new webpack.ProvidePlugin({
+            Buffer: ['buffer', 'Buffer'],
+        }),
+    ],
     mode: 'production',
 };

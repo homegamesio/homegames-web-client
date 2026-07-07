@@ -12,7 +12,8 @@
   "author": "Joseph Garcia",
   "license": "GPL-3.0",
   "dependencies": {
-    "homegames-common": "1.6.0",
+    "buffer": "^6.0.3",
+    "homegames-common": "file:../homegames-common",
     "homepad": "^0.1.2"
   },
   "devDependencies": {
