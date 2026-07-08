@@ -25,9 +25,11 @@ module.exports = {
     },
     plugins: [
         // The squish Squisher (used by LocalSession) builds asset bundles with
-        // Buffer, which browsers don't have.
+        // Buffer, which browsers don't have. Resolve the polyfill absolutely —
+        // squish is file-linked from outside this package, so relative
+        // resolution from its files can't find our node_modules.
         new webpack.ProvidePlugin({
-            Buffer: ['buffer', 'Buffer'],
+            Buffer: [require.resolve('buffer/'), 'Buffer'],
         }),
     ],
     mode: 'production',
