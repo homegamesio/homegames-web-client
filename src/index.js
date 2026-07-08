@@ -465,13 +465,17 @@ class HomegamesClient {
     }
 }
 
-// LocalSession rides along as a static so it survives the UMD build's
-// single default export (library.export: 'default' in webpack.config.js).
+const { packAssetBundle } = require('./asset-bundle');
+
+// LocalSession and packAssetBundle ride along as statics so they survive the
+// UMD build's single default export (library.export: 'default' in
+// webpack.config.js).
 HomegamesClient.LocalSession = LocalSession;
+HomegamesClient.packAssetBundle = packAssetBundle;
 
 // Export for both CommonJS and browser global
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { default: HomegamesClient, HomegamesClient, LocalSession };
+    module.exports = { default: HomegamesClient, HomegamesClient, LocalSession, packAssetBundle };
 }
 if (typeof window !== 'undefined') {
     window.HomegamesClient = HomegamesClient;

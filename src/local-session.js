@@ -212,12 +212,16 @@ class LocalSession {
             try { this.game.handlePlayerDisconnect && this.game.handlePlayerDisconnect(this.playerId); } catch (e) {}
             try { this.game.close && this.game.close(); } catch (e) {}
             try { this.game.destroy && this.game.destroy(); } catch (e) {}
-            // Note: the Squisher's own game-tick interval cannot be cleared —
-            // it doesn't keep the handle. The game's handlers are gone at this
-            // point so ticks are inert, but a long-lived page embedding many
-            // sessions should prefer a fresh page per session for now.
             this.game = null;
         }
+
+        // End the Squisher's tick loop so repeated start/stop cycles — e.g.
+        // Studio hot reload — don't accumulate running tick intervals driving
+        // dead games.
+        if (this.squisher && this.squisher._tickInterval) {
+            clearInterval(this.squisher._tickInterval);
+        }
+        this.squisher = null;
 
         if (this.inputHandler) {
             this.inputHandler.detach();
