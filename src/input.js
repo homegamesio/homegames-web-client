@@ -53,14 +53,7 @@ class InputHandler {
         h.mouseup = (e) => {
             this.mouseDown = false;
             this.mousePos = [e.clientX, e.clientY];
-            const rect = this.canvas.getBoundingClientRect();
-            const clickX = (this.mousePos[0] - rect.left) / rect.width * 100;
-            const clickY = (this.mousePos[1] - rect.top) / rect.height * 100;
-            // Only forward releases that land on the canvas — off-canvas releases
-            // would send out-of-range coords (the click path is bounded the same way).
-            if (clickX >= 0 && clickX <= 100 && clickY >= 0 && clickY <= 100) {
-                this.send(JSON.stringify({ type: 'mouseup', data: { x: clickX, y: clickY } }));
-            }
+            this._sendMouseUp(e.clientX, e.clientY);
         };
 
         h.mousemove = (e) => {
@@ -87,7 +80,18 @@ class InputHandler {
             this.mousePos = [e.touches[0].clientX + window.scrollX, e.touches[0].clientY + window.scrollY];
         };
 
-        h.touchend = () => {
+        h.touchend = (e) => {
+            this.mouseDown = false;
+            // touches is empty by touchend; the lifted finger is in changedTouches.
+            const touch = e.changedTouches && e.changedTouches[0];
+            if (touch) {
+                this._sendMouseUp(touch.clientX, touch.clientY);
+            }
+        };
+
+        h.touchcancel = () => {
+            // Touch was taken over by the OS (gesture, notification shade) —
+            // no release position to report, just clear the held state.
             this.mouseDown = false;
         };
 
@@ -143,6 +147,7 @@ class InputHandler {
         window.addEventListener('touchstart', h.touchstart, { passive: false });
         this.canvas.addEventListener('touchmove', h.touchmove, { passive: false });
         window.addEventListener('touchend', h.touchend);
+        window.addEventListener('touchcancel', h.touchcancel);
         document.addEventListener('keydown', h.keydown);
         document.addEventListener('keyup', h.keyup);
     }
@@ -159,6 +164,7 @@ class InputHandler {
         window.removeEventListener('touchstart', h.touchstart);
         this.canvas.removeEventListener('touchmove', h.touchmove);
         window.removeEventListener('touchend', h.touchend);
+        window.removeEventListener('touchcancel', h.touchcancel);
         document.removeEventListener('keydown', h.keydown);
         document.removeEventListener('keyup', h.keyup);
     }
@@ -236,6 +242,17 @@ class InputHandler {
         return (event.key.length === 1 && event.key >= ' ' && event.key <= 'z') ||
             (event.keyCode >= 36 && event.keyCode <= 40) ||
             event.key === 'Meta' || event.key === 'Backspace' || event.key === 'Enter';
+    }
+
+    _sendMouseUp(clientX, clientY) {
+        const rect = this.canvas.getBoundingClientRect();
+        const clickX = (clientX - rect.left) / rect.width * 100;
+        const clickY = (clientY - rect.top) / rect.height * 100;
+        // Only forward releases that land on the canvas — off-canvas releases
+        // would send out-of-range coords (the click path is bounded the same way).
+        if (clickX >= 0 && clickX <= 100 && clickY >= 0 && clickY <= 100) {
+            this.send(JSON.stringify({ type: 'mouseup', data: { x: clickX, y: clickY } }));
+        }
     }
 
     _onHover(nodeId) {
