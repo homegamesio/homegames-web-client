@@ -9,6 +9,23 @@
 let Homepad = null;
 try { Homepad = require('homepad').Homepad; } catch (e) { /* optional */ }
 
+// Upload cap: matches the platform's single-asset limit, and keeps the
+// wire message (base64 + JSON envelope, ~1.35x the file) safely under the
+// server's 10MB websocket payload cap — oversized messages get the whole
+// connection terminated by ws, not just the message dropped.
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+
+// Encode bytes as base64 without blowing the call stack on MB-sized files
+// (String.fromCharCode.apply is limited by max argument count).
+const uint8ToBase64 = (bytes) => {
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+};
+
 class InputHandler {
     constructor(canvas, sendFn, getThingIndices, assetManager) {
         this.canvas = canvas;
@@ -270,33 +287,13 @@ class InputHandler {
             if (clickInfo.action === 'text') {
                 this.mouseDown = false;
                 const textInput = prompt('Input text');
-                this.send(JSON.stringify({ type: 'input', input: textInput, nodeId: clickInfo.nodeId }));
+                // A cancelled prompt returns null — nothing to deliver.
+                if (textInput !== null) {
+                    this.send(JSON.stringify({ type: 'input', input: textInput, nodeId: clickInfo.nodeId }));
+                }
             } else if (clickInfo.action === 'file') {
                 this.mouseDown = false;
-                const inputEl = document.createElement('input');
-                inputEl.type = 'file';
-                inputEl.style.display = 'none';
-                document.body.appendChild(inputEl);
-                const cleanupInput = () => {
-                    if (inputEl.parentNode) document.body.removeChild(inputEl);
-                };
-                inputEl.onchange = () => {
-                    if (inputEl.files.length > 0) {
-                        const fileReader = new FileReader();
-                        fileReader.onload = () => {
-                            this.send(JSON.stringify({
-                                type: 'input',
-                                input: new Uint8Array(fileReader.result),
-                                nodeId: clickInfo.nodeId
-                            }));
-                        };
-                        fileReader.readAsArrayBuffer(inputEl.files[0]);
-                    }
-                    cleanupInput();
-                };
-                // Clean up if user cancels the file dialog
-                inputEl.addEventListener('cancel', cleanupInput);
-                inputEl.click();
+                this._promptFileUpload(clickInfo.nodeId);
             }
         } else {
             const x = this.mousePos[0];
@@ -308,6 +305,59 @@ class InputHandler {
                 this.send(JSON.stringify({ type: 'click', data: { x: clickX, y: clickY } }));
             }
         }
+    }
+
+    /**
+     * Show the OS file picker for a file-input node and send the selected
+     * file's bytes as base64. The server (and LocalDispatcher) decode the
+     * base64 back into a byte array before handing it to the game's oninput,
+     * along with { kind, contentType, fileName } derived from the bytes and
+     * the metadata sent here.
+     */
+    _promptFileUpload(nodeId) {
+        const inputEl = document.createElement('input');
+        inputEl.type = 'file';
+        // The platform understands image and audio assets; the squished node
+        // carries no per-node accept info, so this is the global filter.
+        inputEl.accept = 'image/*,audio/*';
+        inputEl.style.display = 'none';
+        document.body.appendChild(inputEl);
+        const cleanupInput = () => {
+            if (inputEl.parentNode) inputEl.parentNode.removeChild(inputEl);
+        };
+
+        inputEl.onchange = () => {
+            const file = inputEl.files && inputEl.files[0];
+            cleanupInput();
+            if (!file) return;
+
+            if (file.size > MAX_UPLOAD_BYTES) {
+                const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+                const maxMb = MAX_UPLOAD_BYTES / (1024 * 1024);
+                alert(`That file is ${sizeMb}MB — uploads are limited to ${maxMb}MB.`);
+                return;
+            }
+
+            const fileReader = new FileReader();
+            fileReader.onerror = () => {
+                alert('Could not read that file. Please try a different one.');
+            };
+            fileReader.onload = () => {
+                this.send(JSON.stringify({
+                    type: 'input',
+                    fileEncoding: 'base64',
+                    contentType: file.type || null,
+                    fileName: file.name || null,
+                    input: uint8ToBase64(new Uint8Array(fileReader.result)),
+                    nodeId
+                }));
+            };
+            fileReader.readAsArrayBuffer(file);
+        };
+
+        // Clean up if user cancels the file dialog
+        inputEl.addEventListener('cancel', cleanupInput);
+        inputEl.click();
     }
 
     _translateX(x) {

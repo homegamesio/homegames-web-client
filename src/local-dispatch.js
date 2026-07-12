@@ -15,6 +15,64 @@
  *     handler throwing never takes down the session
  */
 
+// File uploads arrive as base64 (see InputHandler._promptFileUpload); older
+// clients sent a JSON-ified Uint8Array ({"0":137,...}). Decode either into
+// the plain byte array games expect. Mirrors game-session.js _decodeFileInput.
+const MAX_FILE_INPUT_BYTES = 8 * 1024 * 1024;
+
+const decodeFileInput = (raw) => {
+    if (typeof raw === 'string') {
+        let binary;
+        if (typeof atob === 'function') {
+            binary = atob(raw);
+            if (binary.length === 0 || binary.length > MAX_FILE_INPUT_BYTES) return null;
+            const bytes = new Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes;
+        }
+        const buf = Buffer.from(raw, 'base64');
+        if (buf.length === 0 || buf.length > MAX_FILE_INPUT_BYTES) return null;
+        return Array.from(buf);
+    }
+    if (raw && typeof raw === 'object') {
+        const bytes = Object.values(raw);
+        if (bytes.length === 0 || bytes.length > MAX_FILE_INPUT_BYTES) return null;
+        return bytes;
+    }
+    return null;
+};
+
+// Classify uploaded bytes by magic numbers. Authoritative over the
+// client-reported mime, which is spoofable and often missing.
+const sniffFileKind = (b) => {
+    if (b.length > 3 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image'; // PNG
+    if (b.length > 2 && b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image';                  // JPEG
+    if (b.length > 2 && b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image';                  // GIF
+    if (b.length > 11 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46) {              // RIFF
+        if (b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image';           // WEBP
+        if (b[8] === 0x57 && b[9] === 0x41 && b[10] === 0x56 && b[11] === 0x45) return 'audio';           // WAVE
+    }
+    if (b.length > 2 && b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33) return 'audio';                  // MP3 (ID3)
+    if (b.length > 1 && b[0] === 0xFF && (b[1] & 0xE0) === 0xE0) return 'audio';                          // MP3 (frame sync)
+    if (b.length > 3 && b[0] === 0x4F && b[1] === 0x67 && b[2] === 0x67 && b[3] === 0x53) return 'audio'; // Ogg
+    if (b.length > 3 && b[0] === 0x66 && b[1] === 0x4C && b[2] === 0x61 && b[3] === 0x43) return 'audio'; // FLAC
+    if (b.length > 11 && b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) return 'audio'; // MP4/M4A (ftyp)
+    return null;
+};
+
+// Meta passed as oninput's third argument. Mirrors game-session.js.
+const buildFileMeta = (bytes, input) => {
+    const contentType = (typeof input.contentType === 'string' && input.contentType.length <= 100)
+        ? input.contentType : null;
+    let kind = sniffFileKind(bytes);
+    if (!kind && contentType) {
+        if (contentType.indexOf('image/') === 0) kind = 'image';
+        else if (contentType.indexOf('audio/') === 0) kind = 'audio';
+    }
+    const fileName = typeof input.fileName === 'string' ? input.fileName.slice(0, 128) : null;
+    return { kind, contentType, fileName };
+};
+
 class LocalDispatcher {
     /**
      * @param {object} game — the game instance (extends squish Game)
@@ -64,7 +122,8 @@ class LocalDispatcher {
                     const node = this.game.findNode(input.nodeId);
                     if (node && node.node && node.node.input) {
                         if (node.node.input.type === 'file') {
-                            node.node.input.oninput(pid, Object.values(input.input || {}));
+                            const fileBytes = decodeFileInput(input.input);
+                            if (fileBytes) node.node.input.oninput(pid, fileBytes, buildFileMeta(fileBytes, input));
                         } else {
                             node.node.input.oninput(pid, input.input);
                         }

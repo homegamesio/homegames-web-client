@@ -136,9 +136,10 @@ class LocalSession {
         // --- Instantiate game + squisher ---
         try {
             // Same option bag child_game_server passes; persistence and
-            // platform services are stubbed in local mode.
+            // platform services are stubbed in local mode. addAsset is real:
+            // player uploads must render locally just like in a hosted session.
             this.game = new this.gameClass({
-                addAsset: () => Promise.resolve(),
+                addAsset: (key, asset) => this._addLocalAsset(key, asset),
                 saveGame: () => Promise.resolve(),
                 saveData: null,
                 services: {},
@@ -249,6 +250,25 @@ class LocalSession {
     }
 
     // --- Private ---
+
+    // Local counterpart of GameSession.handleNewAsset: a hosted session
+    // rebuilds the asset bundle and pushes it to every client; locally the
+    // one client is us, so store the bytes straight into the AssetManager.
+    // Only in-memory asset data is supported — local sessions can't fetch
+    // from the asset store (same constraint as the assetBundle option).
+    _addLocalAsset(key, asset) {
+        try {
+            const type = (asset && asset.info && asset.info.type) || 'image';
+            const data = asset && asset.data;
+            if (data && this.assetManager) {
+                this.assetManager.storeRawAsset(key, type, data);
+                this._frameDirty = true;
+            }
+        } catch (err) {
+            console.error('[LocalSession] addAsset failed:', err);
+        }
+        return Promise.resolve();
+    }
 
     // Mirrors GameSession._sendPlayerFrame: flush pending changes, take the
     // player-scoped frame, fall back to the broadcast state when the player

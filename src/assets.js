@@ -3,6 +3,25 @@
  * received as binary frames from the game server.
  */
 
+// Bytes -> binary string in chunks (String.fromCharCode.apply is limited by
+// max argument count; MB-sized images would blow the call stack).
+const bytesToBinaryString = (bytes) => {
+    let binary = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.slice(i, i + CHUNK));
+    }
+    return binary;
+};
+
+// Detect the actual image format from magic bytes instead of assuming JPEG.
+const sniffImageMime = (bytes) => {
+    if (bytes.length > 3 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'image/png';
+    if (bytes.length > 2 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+    if (bytes.length > 11 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+    return 'image/jpeg';
+};
+
 class AssetManager {
     constructor() {
         this.assets = {};       // key -> { type, data, decoded }
@@ -57,45 +76,66 @@ class AssetManager {
             const assetType = buf[i + 1];
             const payloadLengthBase32 = String.fromCharCode.apply(null, buf.slice(i + 2, i + 12));
             const payloadLength = parseInt(payloadLengthBase32, 36);
+            // A corrupt length header would otherwise stall or loop the parse.
+            if (!Number.isFinite(payloadLength) || payloadLength <= 0) break;
             const payloadKeyRaw = buf.slice(i + 12, i + 12 + 32);
             const payloadKey = String.fromCharCode.apply(null, payloadKeyRaw.filter(k => k));
             const payloadData = buf.slice(i + 12 + 32, i + 12 + payloadLength);
 
-            if (assetType === 1) {
-                // Image
-                let imgBase64String = '';
-                for (let j = 0; j < payloadData.length; j++) {
-                    imgBase64String += String.fromCharCode(payloadData[j]);
-                }
-                const imgBase64 = btoa(imgBase64String);
-                this.assets[payloadKey] = { type: 'image', data: 'data:image/jpeg;base64,' + imgBase64 };
+            const typeName = assetType === 1 ? 'image' : assetType === 2 ? 'audio' : assetType === 3 ? 'font' : null;
+            if (typeName) {
+                this.storeRawAsset(payloadKey, typeName, payloadData);
+            }
 
-            } else if (assetType === 2) {
-                // Audio
-                if (this.audioCtx) {
-                    this.audioCtx.decodeAudioData(payloadData.buffer, (buffer) => {
-                        this.assets[payloadKey] = { type: 'audio', data: buffer, decoded: true };
+            i += 12 + payloadLength;
+        }
+    }
+
+    /**
+     * Store one asset from raw bytes. Used both by the bundle parser above and
+     * by LocalSession's addAsset (player uploads in serverless local play).
+     */
+    storeRawAsset(key, type, data) {
+        const bytes = data instanceof Uint8Array || data instanceof Uint8ClampedArray
+            ? data
+            : Uint8Array.from(data);
+
+        if (type === 'image') {
+            const mime = sniffImageMime(bytes);
+            this.assets[key] = { type: 'image', data: `data:${mime};base64,` + btoa(bytesToBinaryString(bytes)) };
+            // If the key is reused (e.g. re-upload), drop the stale decode.
+            delete this.imageCache[key];
+            this._notifyReady();
+
+        } else if (type === 'audio') {
+            if (this.audioCtx) {
+                try {
+                    this.audioCtx.decodeAudioData(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), (buffer) => {
+                        this.assets[key] = { type: 'audio', data: buffer, decoded: true };
                         this._notifyReady();
                     }, (err) => {
                         console.warn('Unable to decode audio:', err);
                     });
-                } else {
-                    this.assets[payloadKey] = { type: 'audio', data: payloadData.buffer, decoded: false };
+                } catch (err) {
+                    console.warn('Unable to decode audio:', err);
                 }
-
-            } else if (assetType === 3) {
-                // Font
-                const font = new FontFace(payloadKey, payloadData);
-                if (font) {
-                    font.load().then((loadedFont) => {
-                        document.fonts.add(loadedFont);
-                        this.assets[payloadKey] = { type: 'font', data: loadedFont, name: payloadKey };
-                        this._notifyReady();
-                    });
-                }
+            } else {
+                this.assets[key] = { type: 'audio', data: bytes.buffer, decoded: false };
             }
 
-            i += 12 + payloadLength;
+        } else if (type === 'font') {
+            try {
+                const font = new FontFace(key, bytes);
+                font.load().then((loadedFont) => {
+                    document.fonts.add(loadedFont);
+                    this.assets[key] = { type: 'font', data: loadedFont, name: key };
+                    this._notifyReady();
+                }).catch((err) => {
+                    console.warn('Unable to load font:', err);
+                });
+            } catch (err) {
+                console.warn('Unable to load font:', err);
+            }
         }
     }
 
