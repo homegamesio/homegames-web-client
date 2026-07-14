@@ -167,11 +167,23 @@ class Renderer {
                             // space. naturalWidth/Height are the true decoded
                             // dimensions (image.width/height above were mutated
                             // to destination size).
-                            const sx = (cropLeft / 100) * image.naturalWidth;
-                            const sy = (cropTop / 100) * image.naturalHeight;
-                            const sWidth = (1 - (cropLeft + cropRight) / 100) * image.naturalWidth;
-                            const sHeight = (1 - (cropTop + cropBottom) / 100) * image.naturalHeight;
-                            ctx.drawImage(image, sx, sy, sWidth, sHeight, dx, dy, image.width, image.height);
+                            let sx = (cropLeft / 100) * image.naturalWidth;
+                            let sy = (cropTop / 100) * image.naturalHeight;
+                            let sWidth = (1 - (cropLeft + cropRight) / 100) * image.naturalWidth;
+                            let sHeight = (1 - (cropTop + cropBottom) / 100) * image.naturalHeight;
+                            // Clamp the source rect into the image's real pixel
+                            // bounds. Crop values arrive with 2-decimal wire
+                            // precision, so the computed rect can poke slightly
+                            // past the edge — and WebKit edge-extends samples
+                            // outside the image instead of clipping, smearing
+                            // the last row/column across the overflow.
+                            sx = Math.max(0, Math.min(sx, image.naturalWidth - 1));
+                            sy = Math.max(0, Math.min(sy, image.naturalHeight - 1));
+                            sWidth = Math.min(sWidth, image.naturalWidth - sx);
+                            sHeight = Math.min(sHeight, image.naturalHeight - sy);
+                            if (sWidth >= 1 && sHeight >= 1) {
+                                ctx.drawImage(image, sx, sy, sWidth, sHeight, dx, dy, image.width, image.height);
+                            }
                         } else {
                             ctx.drawImage(image, dx, dy, image.width, image.height);
                         }

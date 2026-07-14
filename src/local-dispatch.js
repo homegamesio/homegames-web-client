@@ -16,8 +16,10 @@
  */
 
 // File uploads arrive as base64 (see InputHandler._promptFileUpload); older
-// clients sent a JSON-ified Uint8Array ({"0":137,...}). Decode either into
-// the plain byte array games expect. Mirrors game-session.js _decodeFileInput.
+// clients sent a JSON-ified Uint8Array ({"0":137,...}). Decode either into a
+// Uint8Array (Buffer in Node) — never a plain number array, which costs ~8x
+// the file size in V8 and games retain these bytes in Assets.
+// Mirrors game-session.js _decodeFileInput.
 const MAX_FILE_INPUT_BYTES = 8 * 1024 * 1024;
 
 const decodeFileInput = (raw) => {
@@ -26,18 +28,18 @@ const decodeFileInput = (raw) => {
         if (typeof atob === 'function') {
             binary = atob(raw);
             if (binary.length === 0 || binary.length > MAX_FILE_INPUT_BYTES) return null;
-            const bytes = new Array(binary.length);
+            const bytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
             return bytes;
         }
         const buf = Buffer.from(raw, 'base64');
         if (buf.length === 0 || buf.length > MAX_FILE_INPUT_BYTES) return null;
-        return Array.from(buf);
+        return buf;
     }
     if (raw && typeof raw === 'object') {
         const bytes = Object.values(raw);
         if (bytes.length === 0 || bytes.length > MAX_FILE_INPUT_BYTES) return null;
-        return bytes;
+        return Uint8Array.from(bytes);
     }
     return null;
 };

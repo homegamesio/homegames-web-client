@@ -4,7 +4,8 @@
 // dependency. Requires must stay static so webpack can bundle them.
 
 const squishMap = {
-    '142': require('squish-142')
+    '142': require('squish-142'),
+    '143': require('squish-143')
 };
 
 const DEFAULT_VERSION = '142';
