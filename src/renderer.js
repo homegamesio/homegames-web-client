@@ -18,8 +18,11 @@ class Renderer {
      * Render a full frame buffer.
      * @param {Uint8ClampedArray} buf - Raw binary frame (type 3)
      * @param {function} unsquish - The unsquish function for the current squish version
+     * @param {object} [opts]
+     * @param {boolean} [opts.muteAudio] - Skip starting audio and stop anything
+     *        playing (used when rendering recorded frames in the inspector)
      */
-    renderFrame(buf, unsquish) {
+    renderFrame(buf, unsquish, opts = {}) {
         const { canvas, ctx, assetManager } = this;
         const soundsToStop = new Set(Object.keys(this.playingSounds));
         const seenSoundAssets = new Set();
@@ -60,14 +63,16 @@ class Renderer {
                     !!thing.handleClick,
                     thing.input && thing.input.type,
                     thing.id,
-                    [textStartX, thing.text.y, textStartX + textWidthPercent, thing.text.y, textStartX + textWidthPercent, thing.text.y + textHeightPercent, textStartX, thing.text.y + textHeightPercent, textStartX, thing.text.y]
+                    [textStartX, thing.text.y, textStartX + textWidthPercent, thing.text.y, textStartX + textWidthPercent, thing.text.y + textHeightPercent, textStartX, thing.text.y + textHeightPercent, textStartX, thing.text.y],
+                    !!thing.onHover
                 ]);
             } else if (thing.coordinates2d !== null && thing.coordinates2d !== undefined) {
                 this.thingIndices.push([
                     !!thing.handleClick,
                     thing.input && thing.input.type,
                     thing.id,
-                    thing.coordinates2d
+                    thing.coordinates2d,
+                    !!thing.onHover
                 ]);
 
                 // --- Effects ---
@@ -124,15 +129,17 @@ class Renderer {
                 const assetData = assetManager.assets[assetKey];
 
                 if (assetData && assetData.type === 'audio') {
-                    seenSoundAssets.add(assetKey);
-                    if (!this.playingSounds[assetKey] && assetManager.audioCtx && assetData.decoded) {
-                        const source = assetManager.audioCtx.createBufferSource();
-                        source.connect(assetManager.audioCtx.destination);
-                        source.buffer = assetData.data;
-                        source.start(0, thing.asset[assetKey].startTime || 0);
-                        this.playingSounds[assetKey] = source;
-                    } else if (this.playingSounds[assetKey]) {
-                        soundsToStop.delete(assetKey);
+                    if (!opts.muteAudio) {
+                        seenSoundAssets.add(assetKey);
+                        if (!this.playingSounds[assetKey] && assetManager.audioCtx && assetData.decoded) {
+                            const source = assetManager.audioCtx.createBufferSource();
+                            source.connect(assetManager.audioCtx.destination);
+                            source.buffer = assetData.data;
+                            source.start(0, thing.asset[assetKey].startTime || 0);
+                            this.playingSounds[assetKey] = source;
+                        } else if (this.playingSounds[assetKey]) {
+                            soundsToStop.delete(assetKey);
+                        }
                     }
                 } else if (assetData && assetData.type !== 'audio') {
                     const asset = thing.asset[assetKey];

@@ -14,26 +14,9 @@
  */
 
 const { squishMap, DEFAULT_VERSION } = require('./squish-map');
-
-// Collapse '.' and '..' segments: 'minigames/../weapons' -> 'weapons'
-const normalizePath = (p) => {
-    const parts = [];
-    for (const seg of p.split('/')) {
-        if (!seg || seg === '.') continue;
-        if (seg === '..') parts.pop();
-        else parts.push(seg);
-    }
-    return parts.join('/');
-};
-
-const resolveInFiles = (files, fromDir, request) => {
-    const base = normalizePath(fromDir ? fromDir + '/' + request : request);
-    const candidates = [base, base + '.js', base + '/index.js'];
-    for (const candidate of candidates) {
-        if (Object.prototype.hasOwnProperty.call(files, candidate)) return candidate;
-    }
-    return null;
-};
+// Shared with the server-side map builders (homegames-core / the API) — the
+// builder and this executor must resolve requires identically.
+const { normalizePath, resolveInFiles } = require('homegames-common/local-play-shared');
 
 const loadGameClass = ({ files, entryPoint }) => {
     if (!files || !entryPoint) {

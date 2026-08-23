@@ -22,6 +22,7 @@ const AssetManager = require('./assets');
 const Renderer = require('./renderer');
 const InputHandler = require('./input');
 const LocalSession = require('./local-session');
+const { createSaveStore } = require('./save-store');
 
 class HomegamesClient {
     /**
@@ -34,6 +35,15 @@ class HomegamesClient {
      * @param {function} [opts.onError] — callback(error) on error
      * @param {boolean} [opts.spectating] — connect as spectator (default false)
      * @param {object} [opts.requestedGame] — { gameId, versionId } to request
+     * @param {function} [opts.onLocalPlayRedirect] — callback({ gameKey, versionId })
+     *        when the server asks this client to run a game single-player.
+     *        Default: swap to an in-place LocalSession fed by the serving
+     *        origin's /games/:gameKey/local-manifest endpoint (as
+     *        homegames-core serves), with a home button back to the session.
+     * @param {function} [opts.onSaveData] — callback(envelope) when the server
+     *        pushes a save (servers with save files disabled deliver saves to
+     *        clients instead). The envelope is already persisted locally;
+     *        embedders can offer a download via HomegamesClient.downloadSave.
      */
     constructor(opts) {
         this.containerId = opts.containerId;
@@ -42,8 +52,16 @@ class HomegamesClient {
         this.onReady = opts.onReady || (() => {});
         this.onClose = opts.onClose || (() => {});
         this.onError = opts.onError || (() => {});
+        this.onSaveData = opts.onSaveData || (() => {});
+        this.onLocalPlayRedirect = opts.onLocalPlayRedirect || null;
+        this._localSession = null;
+        this._localChrome = null;
         this.spectating = opts.spectating || false;
         this.requestedGame = opts.requestedGame || null;
+
+        // Browser-side save persistence, scoped by server host — used when
+        // the server runs the broadcast save backend (opcodes 10/11).
+        this.saveStore = opts.saveStore || createSaveStore();
 
         this.ws = null;
         this.worker = null;
@@ -331,6 +349,11 @@ class HomegamesClient {
                 break;
 
             case 5: // Port redirect (join game session)
+                // A join redirect always means "connect as a player" — clear
+                // any spectator state so a spectator's Join actually drops
+                // them back in (otherwise the reconnect re-announces
+                // spectating: true and they're stuck watching forever).
+                this.spectating = false;
                 this._handlePortRedirect(buf);
                 break;
 
@@ -343,7 +366,208 @@ class HomegamesClient {
                 this.aspectRatio = { x: buf[1], y: buf[2] };
                 this._initCanvas();
                 break;
+
+            case 10: // Save data push (server persists nothing — we do)
+                this._handleSavePush(buf);
+                break;
+
+            case 11: // Save data request (server asks for our stored save)
+                this._handleSaveRequest(buf);
+                break;
+
+            case 12: // Single player — swap this client to an in-place LocalSession
+                this._handleLocalPlayRedirect(buf);
+                break;
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Single player (in-place LocalSession)
+    // -----------------------------------------------------------------------
+
+    _handleLocalPlayRedirect(buf) {
+        let info;
+        try {
+            info = JSON.parse(new TextDecoder().decode(buf.slice(1)));
+        } catch (e) {
+            console.error('Bad local play payload', e);
+            return;
+        }
+        if (!info || !info.gameKey) return;
+
+        if (this.onLocalPlayRedirect) {
+            this.onLocalPlayRedirect(info);
+            return;
+        }
+
+        this.startLocalGame(info);
+    }
+
+    /**
+     * Run a game single-player in this container: fetch its source + assets
+     * from the serving origin's local-manifest endpoints, disconnect from the
+     * session, and boot a LocalSession in place. A home button overlay exits
+     * back to the session this client was connected to (the home port).
+     */
+    startLocalGame({ gameKey, versionId = null } = {}) {
+        const versionQuery = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
+        fetch(`/games/${encodeURIComponent(gameKey)}/local-manifest${versionQuery}`)
+            .then(r => {
+                if (!r.ok) throw new Error('Manifest fetch failed: ' + r.status);
+                return r.json();
+            })
+            .then(manifest => {
+                if (!manifest.localPlayable) {
+                    throw new Error(manifest.reason || 'This game cannot run in single player');
+                }
+                const bundlePromise = manifest.assetCount > 0
+                    ? fetch(manifest.assetBundleUrl).then(r => {
+                        if (!r.ok) throw new Error('Asset bundle fetch failed: ' + r.status);
+                        return r.arrayBuffer();
+                    }).then(ab => new Uint8ClampedArray(ab))
+                    : Promise.resolve(null);
+
+                return bundlePromise.then(assetBundle => ({ manifest, assetBundle }));
+            })
+            .then(({ manifest, assetBundle }) => {
+                // Everything fetched — only now leave the current session, so a
+                // failed fetch leaves the player where they were.
+                this.stop();
+
+                const gameAreaId = this._buildLocalChrome(manifest.name || gameKey);
+
+                this._localSession = new LocalSession({
+                    containerId: gameAreaId,
+                    files: manifest.files,
+                    entryPoint: manifest.entryPoint,
+                    assetBundle,
+                    gameKey,
+                    onSaveData: this.onSaveData,
+                    onError: (err) => {
+                        console.error('Local session error:', err);
+                        this.onError(err);
+                    },
+                });
+                this._localSession.start();
+            })
+            .catch(err => {
+                console.error(err);
+                this.onError(err);
+            });
+    }
+
+    /**
+     * Leave the local game and reconnect to the session this client came
+     * from — the home port dashboard.
+     */
+    exitLocalGame() {
+        if (this._localSession) {
+            this._localSession.stop();
+            this._localSession = null;
+        }
+        this._removeLocalChrome();
+        this.start();
+    }
+
+    // Local-play chrome: a real HTML header bar OUTSIDE the game canvas —
+    // home button + game title — with the game rendering into its own area
+    // below (the canvas letterboxes to the game's aspect ratio in there, so
+    // nothing ever draws over it). Returns the id of the game area element
+    // for LocalSession to render into.
+    _buildLocalChrome(title) {
+        this._removeLocalChrome();
+        const container = document.getElementById(this.containerId);
+        if (!container) return this.containerId;
+
+        container.innerHTML = '';
+        container.style.position = 'relative';
+        container.style.background = '#000';
+
+        const bar = document.createElement('div');
+        bar.style.cssText = 'height:40px;display:flex;align-items:center;gap:12px;'
+            + 'padding:0 10px;background:#4D4D4D;box-sizing:border-box;'
+            + 'font-family:sans-serif;';
+
+        const homeButton = document.createElement('div');
+        homeButton.style.cssText = 'background:#FFF78E;color:#1a1a1a;padding:5px 14px;'
+            + 'border-radius:6px;font-size:14px;cursor:pointer;user-select:none;';
+        homeButton.textContent = '⌂ Home';
+        homeButton.onclick = () => this.exitLocalGame();
+        bar.appendChild(homeButton);
+
+        const titleEl = document.createElement('div');
+        titleEl.style.cssText = 'color:#fff;font-size:14px;opacity:0.85;';
+        titleEl.textContent = title || '';
+        bar.appendChild(titleEl);
+
+        const gameArea = document.createElement('div');
+        gameArea.id = `${this.containerId}-hg-local-area`;
+        gameArea.style.cssText = 'position:relative;width:100%;height:calc(100% - 40px);'
+            + 'overflow:hidden;background:#000;';
+
+        container.appendChild(bar);
+        container.appendChild(gameArea);
+        this._localChrome = { bar, gameArea };
+
+        return gameArea.id;
+    }
+
+    _removeLocalChrome() {
+        if (this._localChrome) {
+            this._localChrome.bar.remove();
+            this._localChrome.gameArea.remove();
+            this._localChrome = null;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Save games (broadcast backend — server keeps nothing, clients do)
+    // -----------------------------------------------------------------------
+
+    // Saves are keyed by server host + gameKey so one server's saves never
+    // leak into sessions on another. Port is excluded on purpose: each game
+    // session runs on its own port of the same host.
+    _saveKey(gameKey) {
+        let host = '';
+        try {
+            host = new URL(this.wsUrl).hostname;
+        } catch (e) {}
+        return host + ':' + gameKey;
+    }
+
+    // Decode a binary frame whose payload (after the opcode byte) is UTF-8 JSON.
+    _decodeJsonPayload(buf) {
+        try {
+            const bytes = new Uint8Array(buf.buffer, buf.byteOffset + 1, buf.length - 1);
+            const text = (typeof TextDecoder !== 'undefined')
+                ? new TextDecoder().decode(bytes)
+                : String.fromCharCode.apply(null, bytes);
+            return JSON.parse(text);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    _handleSavePush(buf) {
+        const envelope = this._decodeJsonPayload(buf);
+        if (!envelope || typeof envelope.gameKey !== 'string') return;
+        this.saveStore.putSave(this._saveKey(envelope.gameKey), envelope).catch(() => {});
+        try {
+            this.onSaveData(envelope);
+        } catch (e) {
+            console.error('[HomegamesClient] onSaveData callback threw:', e);
+        }
+    }
+
+    _handleSaveRequest(buf) {
+        const request = this._decodeJsonPayload(buf);
+        if (!request || typeof request.gameKey !== 'string') return;
+        const respond = (save) => {
+            this._send(JSON.stringify({ type: 'saveData', gameKey: request.gameKey, save: save || null }));
+        };
+        this.saveStore.getSave(this._saveKey(request.gameKey))
+            .then(respond)
+            .catch(() => respond(null));
     }
 
     _handleInit(buf) {
@@ -372,6 +596,10 @@ class HomegamesClient {
         if (this.inputHandler) {
             this.inputHandler.spectating = this.spectating;
             this.inputHandler.bezelInfo = this.bezelInfo;
+            // Gates the held-press behavior: 1.4.4+ gets the single-click
+            // contract (mousemove while held), older versions get legacy
+            // repeated clicks.
+            this.inputHandler.squishVersion = svStr;
         }
 
         this._initCanvas();
@@ -466,16 +694,33 @@ class HomegamesClient {
 }
 
 const { packAssetBundle } = require('./asset-bundle');
+const { fitImageToSize } = require('./image-fit');
 
-// LocalSession and packAssetBundle ride along as statics so they survive the
-// UMD build's single default export (library.export: 'default' in
-// webpack.config.js).
+// Hand a save envelope to the user as a downloadable JSON file. Embedders
+// call this from their onSaveData UI ("game saved — download").
+const downloadSave = (envelope, filename) => {
+    if (!envelope || typeof document === 'undefined') return;
+    const blob = new Blob([JSON.stringify(envelope, null, 2)], { type: 'application/json' });
+    const anchor = document.createElement('a');
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = filename || ((envelope.gameKey || 'game') + '-save.json');
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(anchor.href), 1000);
+};
+
+// LocalSession, packAssetBundle, fitImageToSize, and downloadSave ride along
+// as statics so they survive the UMD build's single default export
+// (library.export: 'default' in webpack.config.js).
 HomegamesClient.LocalSession = LocalSession;
 HomegamesClient.packAssetBundle = packAssetBundle;
+HomegamesClient.fitImageToSize = fitImageToSize;
+HomegamesClient.downloadSave = downloadSave;
 
 // Export for both CommonJS and browser global
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { default: HomegamesClient, HomegamesClient, LocalSession, packAssetBundle };
+    module.exports = { default: HomegamesClient, HomegamesClient, LocalSession, packAssetBundle, fitImageToSize, downloadSave };
 }
 if (typeof window !== 'undefined') {
     window.HomegamesClient = HomegamesClient;

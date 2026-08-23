@@ -5,7 +5,8 @@
 
 const squishMap = {
     '142': require('squish-142'),
-    '143': require('squish-143')
+    '143': require('squish-143'),
+    '144': require('squish-144')
 };
 
 const DEFAULT_VERSION = '142';

@@ -11,6 +11,11 @@
  *   - a click resolves to the topmost node CONTAINING the point (whether or
  *     not it has a click handler), honoring playerIds visibility, and is
  *     silently dropped when that node has no handleClick
+ *   - a physical press is tracked from its first click (press: true) through
+ *     the plain clicks / mousemoves sent while held (drag handlers:
+ *     game.handleMouseMove + pressed node's onDrag) to mouseup (pressed
+ *     node's offClick) — see game-session.js _handleClick/_handleDragMove/
+ *     _endPress
  *   - keys are capped at 20 chars, malformed messages are ignored, and a
  *     handler throwing never takes down the session
  */
@@ -83,6 +88,11 @@ class LocalDispatcher {
     constructor(game, playerId) {
         this.game = game;
         this.playerId = Number(playerId);
+        // Active press (click-and-drag support): which node the press started
+        // on and the last known pointer position. Set on click, updated by
+        // drag moves, cleared by mouseup / node removal. Keyed by playerId to
+        // mirror game-session.js even though local sessions have one player.
+        this._activePresses = {};
     }
 
     /**
@@ -117,6 +127,11 @@ class LocalDispatcher {
                 this.game.handleKeyUp && this.game.handleKeyUp(pid, input.key);
             } else if (input.type === 'mouseup') {
                 this.game.handleMouseUp && this.game.handleMouseUp(pid, input.data);
+                this._endPress(input.data);
+            } else if (input.type === 'mousemove') {
+                // Only sent while the pointer/finger is held down — drives
+                // drag handlers (game.handleMouseMove + pressed node's onDrag)
+                this._handleDragMove(input.data);
             } else if (input.type === 'input') {
                 if (input.gamepad) {
                     this.game.handleGamepadInput && this.game.handleGamepadInput(pid, input);
@@ -149,14 +164,98 @@ class LocalDispatcher {
         if (!click || typeof click.x !== 'number' || typeof click.y !== 'number') return;
         if (click.x < 0 || click.y < 0 || click.x >= 100 || click.y >= 100) return;
 
-        const clickedNode = this._findClick(click.x, click.y);
+        const existingPress = this._activePresses[this.playerId];
+        // Current clients mark the first click of a physical press with
+        // press: true and re-send plain clicks while held. Legacy clients
+        // send no flag at all — for them, a click with no open press starts
+        // one. Either way, held re-sends drive the drag handlers here while
+        // handleClick below still re-fires under the pointer (the
+        // repeated-click contract existing games are built on).
+        const isNewPress = !existingPress || click.press === true;
 
-        if (clickedNode) {
-            const realNode = this.game.findNode(clickedNode.id);
-            if (realNode && realNode.node && realNode.node.handleClick) {
-                realNode.node.handleClick(this.playerId, click.x, click.y);
+        if (existingPress && click.press === true) {
+            // The previous release never reached us (blur, off-canvas
+            // release) — close the stale press out before starting this one.
+            this._endPress(null);
+        } else if (existingPress && !isNewPress) {
+            this._handleDragMove(click);
+        }
+
+        const clickedNode = this._findClick(click.x, click.y);
+        const realNode = clickedNode ? this.game.findNode(clickedNode.id) : null;
+
+        if (isNewPress) {
+            this._activePresses[this.playerId] = {
+                node: (realNode && realNode.node) || null,
+                x: click.x,
+                y: click.y,
+            };
+        }
+
+        if (realNode && realNode.node && realNode.node.handleClick) {
+            realNode.node.handleClick(this.playerId, click.x, click.y);
+        }
+    }
+
+    // A held pointer moved (mousemove input, or a client's repeated click
+    // while held). Updates the press position and fires the drag handlers.
+    // Mirrors game-session.js _handleDragMove (local sessions are frameless,
+    // scale 1, so coordinates pass through untransformed).
+    _handleDragMove(move) {
+        if (!move || typeof move.x !== 'number' || typeof move.y !== 'number') return;
+        if (move.x < 0 || move.y < 0 || move.x >= 100 || move.y >= 100) return;
+
+        const press = this._activePresses[this.playerId];
+        if (press) {
+            press.x = move.x;
+            press.y = move.y;
+        }
+
+        try {
+            this.game.handleMouseMove && this.game.handleMouseMove(this.playerId, { x: move.x, y: move.y });
+        } catch (e) {
+            console.error('[LocalDispatcher] game.handleMouseMove threw:', e);
+        }
+
+        if (press && press.node && typeof press.node.onDrag === 'function') {
+            try {
+                press.node.onDrag(this.playerId, move.x, move.y);
+            } catch (e) {
+                console.error('[LocalDispatcher] node.onDrag threw:', e);
             }
         }
+    }
+
+    // End the active press, firing the pressed node's offClick with the
+    // release point. release may be null (stale press, node removal) — the
+    // last known drag position is used instead. Mirrors game-session.js.
+    _endPress(release) {
+        const press = this._activePresses[this.playerId];
+        if (!press) return;
+        delete this._activePresses[this.playerId];
+
+        if (press.node && typeof press.node.offClick === 'function') {
+            const hasCoords = release && typeof release.x === 'number' && typeof release.y === 'number';
+            const raw = hasCoords ? release : { x: press.x, y: press.y };
+            try {
+                press.node.offClick(this.playerId, raw.x, raw.y);
+            } catch (e) {
+                console.error('[LocalDispatcher] node.offClick threw:', e);
+            }
+        }
+    }
+
+    /**
+     * A pressed node can be removed from the tree mid-drag by game logic.
+     * The press can't meaningfully continue, so close it out (fires
+     * offClick). LocalSession calls this on every squisher flush — the local
+     * analog of the server's coalesced broadcast (game-session.js
+     * _checkActivePresses).
+     */
+    checkActivePresses() {
+        const press = this._activePresses[this.playerId];
+        if (!press || !press.node) return;
+        if (!this.game.findNode(press.node.id)) this._endPress(null);
     }
 
     _findClick(x, y) {

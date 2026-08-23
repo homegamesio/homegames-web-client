@@ -9,6 +9,8 @@
 let Homepad = null;
 try { Homepad = require('homepad').Homepad; } catch (e) { /* optional */ }
 
+const { fitImageToSize } = require('./image-fit');
+
 // Upload cap: matches the platform's single-asset limit, and keeps the
 // wire message (base64 + JSON envelope, ~1.35x the file) safely under the
 // server's 10MB websocket payload cap — oversized messages get the whole
@@ -35,6 +37,9 @@ class InputHandler {
 
         this.mouseDown = false;
         this.mousePos = null;
+        this._pressClickSent = false;
+        this.squishVersion = null;  // set by the session once known (init message / local metadata)
+        this._lastClientPos = null;
         this.keysDown = {};
         this._lastKeyRepeat = {};        // per-key timestamp of last sent keydown
         this._keyRepeatIntervalMs = 33;  // ~30 repeats/sec, decoupled from frame rate
@@ -62,14 +67,18 @@ class InputHandler {
         const h = this._boundHandlers;
 
         h.mousedown = (e) => {
+            this._touchActive = false;
             this.mouseDown = true;
+            this._pressClickSent = false;
             this.mousePos = [e.clientX, e.clientY];
+            this._lastClientPos = [e.clientX, e.clientY];
             this.assetManager.unlockAudio();
         };
 
         h.mouseup = (e) => {
             this.mouseDown = false;
             this.mousePos = [e.clientX, e.clientY];
+            this._lastClientPos = [e.clientX, e.clientY];
             this._sendMouseUp(e.clientX, e.clientY);
         };
 
@@ -82,12 +91,25 @@ class InputHandler {
                 this.mouseDown = false;
             }
             this.mousePos = [e.clientX + window.scrollX, e.clientY + window.scrollY];
+            this._lastClientPos = [e.clientX, e.clientY];
         };
 
         h.touchstart = (e) => {
+            // This handler sits on window, and preventDefault on touchstart
+            // suppresses the synthesized click for whatever was tapped — on an
+            // embedding page (the Studio on mobile) that kills every button
+            // the moment a session starts. Only claim touches that begin on
+            // the game canvas; everything else belongs to the page.
+            if (e.target !== this.canvas) {
+                this._touchActive = false;
+                return;
+            }
             e.preventDefault();
+            this._touchActive = true;
             this.mouseDown = true;
+            this._pressClickSent = false;
             this.mousePos = [e.touches[0].clientX + window.scrollX, e.touches[0].clientY + window.scrollY];
+            this._lastClientPos = [e.touches[0].clientX, e.touches[0].clientY];
             this.assetManager.unlockAudio();
         };
 
@@ -95,20 +117,39 @@ class InputHandler {
             e.preventDefault();
             this.mouseDown = true;
             this.mousePos = [e.touches[0].clientX + window.scrollX, e.touches[0].clientY + window.scrollY];
+            this._lastClientPos = [e.touches[0].clientX, e.touches[0].clientY];
         };
 
         h.touchend = (e) => {
+            // Releases of touches we never claimed (page UI taps) aren't ours
+            if (!this._touchActive) return;
             this.mouseDown = false;
             // touches is empty by touchend; the lifted finger is in changedTouches.
             const touch = e.changedTouches && e.changedTouches[0];
             if (touch) {
+                // iOS only opens a file picker from an activation-triggering
+                // event's call stack — touchend qualifies, the rAF tick() that
+                // handles other clicks does not (and touchstart doesn't
+                // either). So file-input taps must be resolved synchronously
+                // right here; _handleClick skips them for touch interactions.
+                const clickInfo = this._canClick(
+                    touch.clientX + window.scrollX,
+                    touch.clientY + window.scrollY
+                );
+                if (clickInfo.action === 'file') {
+                    this._promptFileUpload(clickInfo.nodeId);
+                }
                 this._sendMouseUp(touch.clientX, touch.clientY);
             }
         };
 
         h.touchcancel = () => {
             // Touch was taken over by the OS (gesture, notification shade) —
-            // no release position to report, just clear the held state.
+            // report the release at the last known position so the server can
+            // close out the press (drag-end / offClick).
+            if (this.mouseDown && this._lastClientPos) {
+                this._sendMouseUp(this._lastClientPos[0], this._lastClientPos[1]);
+            }
             this.mouseDown = false;
         };
 
@@ -153,7 +194,11 @@ class InputHandler {
 
         h.blur = () => {
             // Window lost focus (alt-tab, switched app) while the button was
-            // held — we won't get the mouseup, so clear the held state.
+            // held — we won't get the mouseup, so clear the held state and
+            // tell the server the press ended where we last saw the pointer.
+            if (this.mouseDown && this._lastClientPos) {
+                this._sendMouseUp(this._lastClientPos[0], this._lastClientPos[1]);
+            }
             this.mouseDown = false;
         };
 
@@ -228,20 +273,38 @@ class InputHandler {
 
         const clickInfo = this._canClick(this.mousePos[0], this.mousePos[1]);
 
-        // Click on hold
+        // Press + drag. The first tick of a physical press sends a click
+        // marked press: true. What happens while held depends on the game's
+        // squish version:
+        //   1.4.4+ — one press = one onClick. Movement sends mousemove
+        //   (~30ms throttle), which the server routes to the drag handlers
+        //   (handleMouseMove / onDrag); release sends mouseup (offClick).
+        //   older  — clicks are re-sent while held (~30ms), the repeated-
+        //   click contract those games' interactions were built on.
         if (this.mouseDown && !this.clickStopper) {
-            this._handleClick(clickInfo);
+            if (!this._pressClickSent) {
+                this._pressClickSent = true;
+                this._handleClick(clickInfo, true);
+            } else if (this._usesSingleClickContract()) {
+                this._sendMouseMove(this.mousePos[0], this.mousePos[1]);
+            } else {
+                this._handleClick(clickInfo, false);
+            }
             this.clickStopper = setTimeout(() => { this.clickStopper = null; }, 30);
         }
 
-        // Hover tracking
-        if (clickInfo.isClickable || clickInfo.action) {
+        // Hover tracking. onhover/offhover fire for clickable nodes (as
+        // before) and for nodes that declared an onHover handler — the
+        // squished state marks those, mirroring how handleClick presence
+        // drives clicks. The pointer cursor stays clickable-only: hoverable
+        // alone doesn't imply "you can click this".
+        if (clickInfo.isClickable || clickInfo.action || clickInfo.isHoverable) {
             if (!this.currentHover || Number(clickInfo.nodeId) !== Number(this.currentHover)) {
                 if (this.currentHover) this._offHover(this.currentHover);
                 this.currentHover = clickInfo.nodeId;
                 this._onHover(clickInfo.nodeId);
             }
-            this.canvas.style.cursor = 'pointer';
+            this.canvas.style.cursor = (clickInfo.isClickable || clickInfo.action) ? 'pointer' : 'initial';
         } else {
             if (this.currentHover) {
                 this._offHover(this.currentHover);
@@ -265,11 +328,35 @@ class InputHandler {
         const rect = this.canvas.getBoundingClientRect();
         const clickX = (clientX - rect.left) / rect.width * 100;
         const clickY = (clientY - rect.top) / rect.height * 100;
-        // Only forward releases that land on the canvas — off-canvas releases
-        // would send out-of-range coords (the click path is bounded the same way).
-        if (clickX >= 0 && clickX <= 100 && clickY >= 0 && clickY <= 100) {
-            this.send(JSON.stringify({ type: 'mouseup', data: { x: clickX, y: clickY } }));
-        }
+        // Clamp off-canvas releases to the canvas edge instead of dropping
+        // them — the server needs every release to close out presses
+        // (drag-end / offClick), even ones that finish outside the canvas.
+        const x = Math.min(99.99, Math.max(0, clickX));
+        const y = Math.min(99.99, Math.max(0, clickY));
+        this.send(JSON.stringify({ type: 'mouseup', data: { x, y } }));
+    }
+
+    // Whether the game's squish version uses the single-click contract
+    // (onClick once per press, mousemove while held, mouseup on release).
+    // Modern version strings are three digits ('142', '144'); anything else
+    // ('0767' / '1000'-style) predates drag support entirely — both get the
+    // legacy repeated-click behavior.
+    _usesSingleClickContract() {
+        const v = this.squishVersion;
+        if (!v || !/^[1-9]\d{2}$/.test(v)) return false;
+        return Number(v) >= 144;
+    }
+
+    // Held-pointer movement. Same coordinate math as _handleClick; clamped
+    // to the canvas edge (like mouseup) so drags that wander off-canvas keep
+    // tracking instead of going silent.
+    _sendMouseMove(posX, posY) {
+        const rect = this.canvas.getBoundingClientRect();
+        const moveX = (posX - rect.left) / rect.width * 100;
+        const moveY = (posY - rect.top) / rect.height * 100;
+        const x = Math.min(99.99, Math.max(0, moveX));
+        const y = Math.min(99.99, Math.max(0, moveY));
+        this.send(JSON.stringify({ type: 'mousemove', data: { x, y } }));
     }
 
     _onHover(nodeId) {
@@ -280,7 +367,7 @@ class InputHandler {
         this.send(JSON.stringify({ type: 'offhover', nodeId }));
     }
 
-    _handleClick(clickInfo) {
+    _handleClick(clickInfo, isNewPress) {
         if (!this.mousePos) return;
 
         if (clickInfo.action) {
@@ -293,7 +380,12 @@ class InputHandler {
                 }
             } else if (clickInfo.action === 'file') {
                 this.mouseDown = false;
-                this._promptFileUpload(clickInfo.nodeId);
+                // Touch taps open the picker synchronously from touchend
+                // (iOS user-activation requirement); prompting here too would
+                // double-open on platforms that allow both.
+                if (!this._touchActive) {
+                    this._promptFileUpload(clickInfo.nodeId);
+                }
             }
         } else {
             const x = this.mousePos[0];
@@ -302,17 +394,24 @@ class InputHandler {
             const clickX = (x - rect.left) / rect.width * 100;
             const clickY = (y - rect.top) / rect.height * 100;
             if (clickX >= 0 && clickX <= 100 && clickY >= 0 && clickY <= 100) {
-                this.send(JSON.stringify({ type: 'click', data: { x: clickX, y: clickY } }));
+                // press: true marks the start of a physical press so the
+                // server can track it through the held re-sends and mouseup
+                // (drag support); re-sends while held carry no flag.
+                const data = { x: clickX, y: clickY };
+                if (isNewPress) data.press = true;
+                this.send(JSON.stringify({ type: 'click', data }));
             }
         }
     }
 
     /**
      * Show the OS file picker for a file-input node and send the selected
-     * file's bytes as base64. The server (and LocalDispatcher) decode the
-     * base64 back into a byte array before handing it to the game's oninput,
-     * along with { kind, contentType, fileName } derived from the bytes and
-     * the metadata sent here.
+     * file's bytes as base64. Images over MAX_UPLOAD_BYTES are transparently
+     * shrunk to fit (see image-fit.js); other oversized files are rejected.
+     * The server (and LocalDispatcher) decode the base64 back into a byte
+     * array before handing it to the game's oninput, along with
+     * { kind, contentType, fileName } derived from the bytes and the
+     * metadata sent here.
      */
     _promptFileUpload(nodeId) {
         const inputEl = document.createElement('input');
@@ -326,16 +425,24 @@ class InputHandler {
             if (inputEl.parentNode) inputEl.parentNode.removeChild(inputEl);
         };
 
-        inputEl.onchange = () => {
+        inputEl.onchange = async () => {
             const file = inputEl.files && inputEl.files[0];
             cleanupInput();
             if (!file) return;
 
+            let upload = { blob: file, contentType: file.type || null, fileName: file.name || null };
             if (file.size > MAX_UPLOAD_BYTES) {
-                const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
-                const maxMb = MAX_UPLOAD_BYTES / (1024 * 1024);
-                alert(`That file is ${sizeMb}MB — uploads are limited to ${maxMb}MB.`);
-                return;
+                // Oversized images are shrunk to fit instead of rejected.
+                // fitImageToSize throws for anything it can't decode as an
+                // image (audio, corrupt files), which falls back to the cap.
+                try {
+                    upload = await fitImageToSize(file, MAX_UPLOAD_BYTES);
+                } catch (e) {
+                    const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+                    const maxMb = MAX_UPLOAD_BYTES / (1024 * 1024);
+                    alert(`That file is ${sizeMb}MB — uploads are limited to ${maxMb}MB, and it couldn't be resized automatically.`);
+                    return;
+                }
             }
 
             const fileReader = new FileReader();
@@ -346,13 +453,13 @@ class InputHandler {
                 this.send(JSON.stringify({
                     type: 'input',
                     fileEncoding: 'base64',
-                    contentType: file.type || null,
-                    fileName: file.name || null,
+                    contentType: upload.contentType,
+                    fileName: upload.fileName,
                     input: uint8ToBase64(new Uint8Array(fileReader.result)),
                     nodeId
                 }));
             };
-            fileReader.readAsArrayBuffer(file);
+            fileReader.readAsArrayBuffer(upload.blob);
         };
 
         // Clean up if user cancels the file dialog
@@ -372,11 +479,12 @@ class InputHandler {
 
     _canClick(x, y) {
         let isClickable = false;
+        let isHoverable = false;
         let action = null;
         let nodeId = null;
 
         const rect = this.canvas.getBoundingClientRect();
-        if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return { isClickable, action, nodeId };
+        if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return { isClickable, isHoverable, action, nodeId };
 
         const thingIndices = this.getThingIndices();
 
@@ -427,10 +535,11 @@ class InputHandler {
                 isClickable = chunk[0];
                 action = chunk[1];
                 nodeId = chunk[2];
+                isHoverable = !!chunk[4];
             }
         }
 
-        return { isClickable, action, nodeId };
+        return { isClickable, isHoverable, action, nodeId };
     }
 }
 
