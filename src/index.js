@@ -1,3 +1,7 @@
+const SessionController = require('./session-controller');
+const createLocalChrome = require('./local-game-chrome');
+const { loadLocalGame, loadHomeGame } = require('./local-game-loader');
+const { GameView, FrameLoop, getClientInfo } = require('./game-view');
 /**
  * HomegamesClient — Embeddable game client for Homegames.
  *
@@ -8,7 +12,7 @@
  *   });
  *   client.start();
  *
- * Usage (Web Worker WebSocket — keeps binary processing off main thread):
+ * Usage (Web Worker WebSocket — keeps socket I/O off the main thread):
  *   const client = new HomegamesClient({
  *       containerId: 'game-div',
  *       wsUrl: 'ws://localhost:8300',
@@ -18,9 +22,6 @@
  */
 
 const { squishMap, DEFAULT_VERSION } = require('./squish-map');
-const AssetManager = require('./assets');
-const Renderer = require('./renderer');
-const InputHandler = require('./input');
 const LocalSession = require('./local-session');
 const { createSaveStore } = require('./save-store');
 
@@ -44,6 +45,9 @@ class HomegamesClient {
      *        pushes a save (servers with save files disabled deliver saves to
      *        clients instead). The envelope is already persisted locally;
      *        embedders can offer a download via HomegamesClient.downloadSave.
+     * @param {function} [opts.loadLocalGame] — async (request, { signal }) =>
+     *        { files, entryPoint, assetBundle, gameKey, versionId, name }.
+     *        Override the default home-server manifest loader for another host.
      */
     constructor(opts) {
         this.containerId = opts.containerId;
@@ -54,10 +58,9 @@ class HomegamesClient {
         this.onError = opts.onError || (() => {});
         this.onSaveData = opts.onSaveData || (() => {});
         this.onLocalPlayRedirect = opts.onLocalPlayRedirect || null;
-        this._localSession = null;
-        this._localChrome = null;
         this.spectating = opts.spectating || false;
         this.requestedGame = opts.requestedGame || null;
+        this.gamepadOptions = opts.gamepad ?? {};
 
         // Browser-side save persistence, scoped by server host — used when
         // the server runs the broadcast save backend (opcodes 10/11).
@@ -65,11 +68,7 @@ class HomegamesClient {
 
         this.ws = null;
         this.worker = null;
-        this.canvas = null;
-        this.container = null;
-        this.assetManager = null;
-        this.renderer = null;
-        this.inputHandler = null;
+        this.view = null;
 
         this.playerId = null;
         this.aspectRatio = null;
@@ -78,49 +77,52 @@ class HomegamesClient {
         this.unsquish = null;
 
         this.currentBuf = null;
-        this.rendering = false;
         // Only re-unsquish + redraw when something actually changed (new state
         // buffer, resize, or aspect-ratio change). Avoids burning a full frame
         // decode + canvas repaint 60x/sec while the game is idle.
         this._frameDirty = false;
-        this._rafId = null;
+        this._loop = new FrameLoop(() => this._paintFrame());
         this._resizeHandler = null;
+
+        this._sessions = new SessionController({
+            remote: { start: () => this._startRemote(), stop: () => this._stopRemote() },
+            loadLocal: opts.loadLocalGame || loadHomeGame,
+            mountLocal: game => createLocalChrome(this.containerId, game.name || game.gameKey, () => this.exitLocalGame()),
+            createLocal: game => new LocalSession({ ...game,
+                gamepad: this.gamepadOptions, saveStore: this.saveStore,
+                onSaveData: this.onSaveData, onError: this.onError,
+            }),
+            onError: this.onError,
+        });
     }
 
     /**
      * Connect to the game session and start rendering.
      */
-    start() {
-        // --- Set up DOM ---
-        this.container = document.getElementById(this.containerId);
-        if (!this.container) {
+    start() { this._sessions.start(); }
+    stop() { this._sessions.stop(); }
+    get _localSession() { return this._sessions.local; }
+    get _localChrome() { return this._sessions.chrome; }
+
+    get canvas() { return this.view?.canvas || null; }
+    get container() { return this.view?.container || null; }
+    get renderer() { return this.view?.renderer || null; }
+    get assetManager() { return this.view?.assetManager || null; }
+    get inputHandler() { return this.view?.inputHandler || null; }
+    get rendering() { return this._loop.running; }
+
+    _startRemote() {
+        const container = document.getElementById(this.containerId);
+        if (!container) {
             this.onError(new Error('Container element not found: #' + this.containerId));
             return;
         }
 
-        this.container.innerHTML = '';
-        this.container.style.position = 'relative';
-        this.container.style.overflow = 'hidden';
-        this.container.style.background = '#000';
-
-        this.canvas = document.createElement('canvas');
-        this.canvas.style.display = 'block';
-        this.canvas.style.margin = '0 auto';
-        this.container.appendChild(this.canvas);
-
-        // --- Set up subsystems ---
-        this.assetManager = new AssetManager();
-        // When an asset finishes loading async (image/font/audio), repaint the
-        // current frame — it may have rendered before the asset was ready.
-        this.assetManager.onAssetReady = () => { this._frameDirty = true; };
-        this.renderer = new Renderer(this.canvas, this.assetManager);
-        this.inputHandler = new InputHandler(
-            this.canvas,
-            (msg) => this._send(msg),
-            () => this.renderer.thingIndices,
-            this.assetManager
-        );
-        this.inputHandler.attach();
+        this.view = new GameView({
+            container, send: msg => this._send(msg),
+            gamepad: this.gamepadOptions,
+            onAssetReady: () => { this._frameDirty = true; },
+        });
 
         // --- Handle resize ---
         this._resizeHandler = () => {
@@ -141,13 +143,8 @@ class HomegamesClient {
     /**
      * Disconnect and clean up everything.
      */
-    stop() {
-        this.rendering = false;
-
-        if (this._rafId) {
-            cancelAnimationFrame(this._rafId);
-            this._rafId = null;
-        }
+    _stopRemote() {
+        this._loop.stop();
 
         if (this.worker) {
             this.worker.postMessage({ type: 'close' });
@@ -156,33 +153,18 @@ class HomegamesClient {
         }
 
         if (this.ws) {
-            this.ws.onclose = null;
-            this.ws.close();
+            const ws = this.ws;
             this.ws = null;
+            ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+            ws.close();
         }
 
-        if (this.inputHandler) {
-            this.inputHandler.detach();
-            this.inputHandler = null;
-        }
-
-        if (this.renderer) {
-            this.renderer.stopAllSounds();
-            this.renderer = null;
-        }
-
-        if (this.assetManager) {
-            this.assetManager.destroy();
-            this.assetManager = null;
-        }
+        this.view?.destroy();
+        this.view = null;
 
         if (this._resizeHandler) {
             window.removeEventListener('resize', this._resizeHandler);
             this._resizeHandler = null;
-        }
-
-        if (this.container) {
-            this.container.innerHTML = '';
         }
     }
 
@@ -198,14 +180,7 @@ class HomegamesClient {
         }
     }
 
-    _sendClientInfo() {
-        const clientInfo = this._getClientInfo();
-        if (this.worker) {
-            this.worker.postMessage({ type: 'send', data: JSON.stringify({ clientInfo }) });
-        } else if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(JSON.stringify({ clientInfo }));
-        }
-    }
+    _sendClientInfo() { this._send(JSON.stringify({ clientInfo: getClientInfo() })); }
 
     // -----------------------------------------------------------------------
     // Inline WebSocket connection (no worker)
@@ -220,11 +195,13 @@ class HomegamesClient {
             return;
         }
 
+        const ws = this.ws;
         this.ws.onopen = () => {
+            if (this.ws !== ws) return;
             const readyMsg = {
                 type: 'ready',
                 spectating: this.spectating,
-                clientInfo: { clientInfo: this._getClientInfo() },
+                clientInfo: { clientInfo: getClientInfo() },
             };
             if (this.requestedGame) {
                 readyMsg.clientInfo.requestedGame = this.requestedGame;
@@ -233,17 +210,20 @@ class HomegamesClient {
         };
 
         this.ws.onmessage = (event) => {
+            if (this.ws !== ws) return;
             if (event.data instanceof ArrayBuffer) {
                 this._handleBinaryMessage(new Uint8ClampedArray(event.data));
             }
         };
 
         this.ws.onclose = () => {
-            this.rendering = false;
+            if (this.ws !== ws) return;
+            this._loop.stop();
             this.onClose();
         };
 
         this.ws.onerror = (err) => {
+            if (this.ws !== ws) return;
             this.onError(err);
         };
     }
@@ -261,7 +241,9 @@ class HomegamesClient {
             return;
         }
 
+        const worker = this.worker;
         this.worker.onmessage = (event) => {
+            if (this.worker !== worker) return;
             const data = event.data;
 
             if (data instanceof ArrayBuffer) {
@@ -272,11 +254,11 @@ class HomegamesClient {
                     type: 'sendReady',
                     id: this.playerId,
                     spectating: this.spectating,
-                    clientInfo: { clientInfo: this._getClientInfo() },
+                    clientInfo: { clientInfo: getClientInfo() },
                     requestedGame: this.requestedGame,
                 });
             } else if (data && data.type === 'close') {
-                this.rendering = false;
+                this._loop.stop();
                 this.onClose();
             } else if (data && data.type === 'error') {
                 this.onError(new Error(data.message));
@@ -284,6 +266,7 @@ class HomegamesClient {
         };
 
         this.worker.onerror = (err) => {
+            if (this.worker !== worker) return;
             this.onError(err);
         };
 
@@ -297,7 +280,7 @@ class HomegamesClient {
 
     _reconnect(newWsUrl) {
         this.wsUrl = newWsUrl;
-        this.rendering = false;
+        this._loop.stop();
         this.currentBuf = null;
 
         // Clear stale state from previous session
@@ -342,10 +325,7 @@ class HomegamesClient {
             case 3: // Game state frame
                 this.currentBuf = buf;
                 this._frameDirty = true;
-                if (!this.rendering) {
-                    this.rendering = true;
-                    this._renderLoop();
-                }
+                this._loop.start();
                 break;
 
             case 5: // Port redirect (join game session)
@@ -409,116 +389,8 @@ class HomegamesClient {
      * session, and boot a LocalSession in place. A home button overlay exits
      * back to the session this client was connected to (the home port).
      */
-    startLocalGame({ gameKey, versionId = null } = {}) {
-        const versionQuery = versionId ? `?versionId=${encodeURIComponent(versionId)}` : '';
-        fetch(`/games/${encodeURIComponent(gameKey)}/local-manifest${versionQuery}`)
-            .then(r => {
-                if (!r.ok) throw new Error('Manifest fetch failed: ' + r.status);
-                return r.json();
-            })
-            .then(manifest => {
-                if (!manifest.localPlayable) {
-                    throw new Error(manifest.reason || 'This game cannot run in single player');
-                }
-                const bundlePromise = manifest.assetCount > 0
-                    ? fetch(manifest.assetBundleUrl).then(r => {
-                        if (!r.ok) throw new Error('Asset bundle fetch failed: ' + r.status);
-                        return r.arrayBuffer();
-                    }).then(ab => new Uint8ClampedArray(ab))
-                    : Promise.resolve(null);
-
-                return bundlePromise.then(assetBundle => ({ manifest, assetBundle }));
-            })
-            .then(({ manifest, assetBundle }) => {
-                // Everything fetched — only now leave the current session, so a
-                // failed fetch leaves the player where they were.
-                this.stop();
-
-                const gameAreaId = this._buildLocalChrome(manifest.name || gameKey);
-
-                this._localSession = new LocalSession({
-                    containerId: gameAreaId,
-                    files: manifest.files,
-                    entryPoint: manifest.entryPoint,
-                    assetBundle,
-                    gameKey,
-                    onSaveData: this.onSaveData,
-                    onError: (err) => {
-                        console.error('Local session error:', err);
-                        this.onError(err);
-                    },
-                });
-                this._localSession.start();
-            })
-            .catch(err => {
-                console.error(err);
-                this.onError(err);
-            });
-    }
-
-    /**
-     * Leave the local game and reconnect to the session this client came
-     * from — the home port dashboard.
-     */
-    exitLocalGame() {
-        if (this._localSession) {
-            this._localSession.stop();
-            this._localSession = null;
-        }
-        this._removeLocalChrome();
-        this.start();
-    }
-
-    // Local-play chrome: a real HTML header bar OUTSIDE the game canvas —
-    // home button + game title — with the game rendering into its own area
-    // below (the canvas letterboxes to the game's aspect ratio in there, so
-    // nothing ever draws over it). Returns the id of the game area element
-    // for LocalSession to render into.
-    _buildLocalChrome(title) {
-        this._removeLocalChrome();
-        const container = document.getElementById(this.containerId);
-        if (!container) return this.containerId;
-
-        container.innerHTML = '';
-        container.style.position = 'relative';
-        container.style.background = '#000';
-
-        const bar = document.createElement('div');
-        bar.style.cssText = 'height:40px;display:flex;align-items:center;gap:12px;'
-            + 'padding:0 10px;background:#4D4D4D;box-sizing:border-box;'
-            + 'font-family:sans-serif;';
-
-        const homeButton = document.createElement('div');
-        homeButton.style.cssText = 'background:#FFF78E;color:#1a1a1a;padding:5px 14px;'
-            + 'border-radius:6px;font-size:14px;cursor:pointer;user-select:none;';
-        homeButton.textContent = '⌂ Home';
-        homeButton.onclick = () => this.exitLocalGame();
-        bar.appendChild(homeButton);
-
-        const titleEl = document.createElement('div');
-        titleEl.style.cssText = 'color:#fff;font-size:14px;opacity:0.85;';
-        titleEl.textContent = title || '';
-        bar.appendChild(titleEl);
-
-        const gameArea = document.createElement('div');
-        gameArea.id = `${this.containerId}-hg-local-area`;
-        gameArea.style.cssText = 'position:relative;width:100%;height:calc(100% - 40px);'
-            + 'overflow:hidden;background:#000;';
-
-        container.appendChild(bar);
-        container.appendChild(gameArea);
-        this._localChrome = { bar, gameArea };
-
-        return gameArea.id;
-    }
-
-    _removeLocalChrome() {
-        if (this._localChrome) {
-            this._localChrome.bar.remove();
-            this._localChrome.gameArea.remove();
-            this._localChrome = null;
-        }
-    }
+    startLocalGame(request) { return this._sessions.startLocal(request); }
+    exitLocalGame() { this._sessions.start(); }
 
     // -----------------------------------------------------------------------
     // Save games (broadcast backend — server keeps nothing, clients do)
@@ -620,46 +492,17 @@ class HomegamesClient {
     _initCanvas() {
         if (!this.aspectRatio || !this.container) return;
 
-        const maxWidth = this.container.clientWidth || window.innerWidth;
-        const maxHeight = this.container.clientHeight || window.innerHeight;
-
-        const canFitHeight = (maxWidth * this.aspectRatio.y / this.aspectRatio.x) <= maxHeight;
-
-        let canvasWidth, canvasHeight;
-
-        if (canFitHeight) {
-            canvasWidth = maxWidth;
-            canvasHeight = Math.floor(maxWidth * (this.aspectRatio.y / this.aspectRatio.x));
-        } else {
-            canvasHeight = maxHeight;
-            canvasWidth = Math.floor(maxHeight * (this.aspectRatio.x / this.aspectRatio.y));
-        }
-
-        // Use 2x resolution for crisp rendering
-        this.canvas.width = 2 * canvasWidth;
-        this.canvas.height = 2 * canvasHeight;
-        this.canvas.style.width = canvasWidth + 'px';
-        this.canvas.style.height = canvasHeight + 'px';
-
-        const clientWidth = canvasWidth;
-        const clientHeight = canvasHeight;
-
-        if (this.inputHandler) {
-            this.inputHandler.clientWidth = clientWidth;
-            this.inputHandler.clientHeight = clientHeight;
-        }
+        this.view.resize(this.aspectRatio);
 
         // Resizing clears the canvas, so the current frame must be repainted.
         this._frameDirty = true;
     }
 
-    _renderLoop() {
+    _paintFrame() {
         if (!this.rendering) return;
 
         // Process input
-        if (this.inputHandler) {
-            this.inputHandler.tick();
-        }
+        this.inputHandler?.tick();
 
         // Render current frame — only when something changed since the last paint.
         // The input tick above still runs every frame (hover, gamepad polling).
@@ -667,30 +510,8 @@ class HomegamesClient {
             this.renderer.renderFrame(this.currentBuf, this.unsquish);
             this._frameDirty = false;
         }
-
-        this._rafId = requestAnimationFrame(() => this._renderLoop());
     }
 
-    _getClientInfo() {
-        const ua = navigator.userAgent;
-        const info = {};
-
-        if (/(tablet|ipad|playbook|silk)|(android(?!.*mobi))/i.test(ua)) {
-            info.deviceType = 'tablet';
-        } else if (/Mobile|iP(hone|od)|Android|BlackBerry|IEMobile|Kindle|Silk-Accelerated|(hpw|web)OS|Opera M(obi|ini)/.test(ua)) {
-            info.deviceType = 'mobile';
-        } else if (navigator.maxTouchPoints && navigator.maxTouchPoints > 2) {
-            info.deviceType = 'tablet';
-        } else {
-            info.deviceType = 'desktop';
-        }
-
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-        if (w && h) info.aspectRatio = w / h;
-
-        return info;
-    }
 }
 
 const { packAssetBundle } = require('./asset-bundle');
@@ -714,13 +535,14 @@ const downloadSave = (envelope, filename) => {
 // as statics so they survive the UMD build's single default export
 // (library.export: 'default' in webpack.config.js).
 HomegamesClient.LocalSession = LocalSession;
+HomegamesClient.loadLocalGame = loadLocalGame;
 HomegamesClient.packAssetBundle = packAssetBundle;
 HomegamesClient.fitImageToSize = fitImageToSize;
 HomegamesClient.downloadSave = downloadSave;
 
 // Export for both CommonJS and browser global
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { default: HomegamesClient, HomegamesClient, LocalSession, packAssetBundle, fitImageToSize, downloadSave };
+    module.exports = { default: HomegamesClient, HomegamesClient, LocalSession, loadLocalGame, packAssetBundle, fitImageToSize, downloadSave };
 }
 if (typeof window !== 'undefined') {
     window.HomegamesClient = HomegamesClient;

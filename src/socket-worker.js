@@ -26,6 +26,7 @@ const connect = (wsUrl) => {
         socket.onclose = null;
         socket.onerror = null;
         socket.onmessage = null;
+        socket.onopen = null;
         try { socket.close(); } catch (e) {}
     }
 
@@ -36,12 +37,15 @@ const connect = (wsUrl) => {
         return;
     }
     socket.binaryType = 'arraybuffer';
+    const connection = socket;
 
     socket.onopen = () => {
+        if (socket !== connection) return;
         postMessage({ type: 'open' });
     };
 
     socket.onmessage = (event) => {
+        if (socket !== connection) return;
         // Forward binary data directly (zero-copy via transferable)
         if (event.data instanceof ArrayBuffer) {
             postMessage(event.data, [event.data]);
@@ -52,11 +56,13 @@ const connect = (wsUrl) => {
     };
 
     socket.onclose = () => {
+        if (socket !== connection) return;
         postMessage({ type: 'close' });
         socket = null;
     };
 
     socket.onerror = (err) => {
+        if (socket !== connection) return;
         postMessage({ type: 'error', message: err.message || 'WebSocket error' });
     };
 };

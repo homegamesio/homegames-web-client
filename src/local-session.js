@@ -1,16 +1,17 @@
+const createLocalRuntime = require('./local-game-runtime');
+const { GameView, FrameLoop, getClientInfo } = require('./game-view');
 /**
  * LocalSession — runs a Homegames game entirely in the browser, no server.
  *
- * The game class is instantiated locally, the real squish Squisher drives the
- * tick loop and per-player frame generation (so playerIds visibility, state
- * coalescing, and z-order behave byte-identically to a hosted session), and
- * a LocalDispatcher replicates the server's input semantics. The existing
+ * The game class is instantiated locally, LocalRuntime owns its tick clock,
+ * and the real Squish Squisher generates per-player frames. LocalDispatcher
+ * and the server use the same GameDispatcher for game-facing input. The existing
  * Renderer / AssetManager / InputHandler are reused unchanged — from their
  * point of view this looks like a normal connected session.
  *
- * Single-player by design: one fake local player (default id 1) "joins" at
- * start(). Games that require multiplayer services or homenames identity are
- * not supported here.
+ * One simulated player (default id 1) joins at start(); addPlayer() creates
+ * extra views of the same game for Studio testing. This provides no networking
+ * or Homenames identity. Games requiring server-only services cannot run here.
  *
  * Usage:
  *   const session = new LocalSession({
@@ -26,9 +27,6 @@
  */
 
 const { squishMap, DEFAULT_VERSION } = require('./squish-map');
-const AssetManager = require('./assets');
-const Renderer = require('./renderer');
-const InputHandler = require('./input');
 const LocalDispatcher = require('./local-dispatch');
 const { loadGameClass } = require('./game-loader');
 const {
@@ -64,6 +62,8 @@ class LocalSession {
      * @param {string} [opts.playerName] — local player name (default: generated)
      * @param {string} [opts.gameKey] — stable key for save-game storage
      *        (default: the game class's name)
+     * @param {string} [opts.versionId] — version for save compatibility checks
+     *        (default: local-game-version for unversioned games)
      * @param {function} [opts.onSaveData] — callback(envelope) after a save
      *        is persisted locally
      * @param {object} [opts.saveStore] — injectable save store (testing)
@@ -74,6 +74,7 @@ class LocalSession {
      * @param {function} [opts.onError] — callback(error)
      */
     constructor(opts) {
+        this.gamepadOptions = opts.gamepad ?? {};
         this.containerId = opts.containerId;
         this.gameClass = opts.gameClass || null;
         this.files = opts.files || null;
@@ -84,72 +85,66 @@ class LocalSession {
         this.onReady = opts.onReady || (() => {});
         this.onError = opts.onError || (() => {});
         this.gameKey = opts.gameKey || null;
+        this.versionId = opts.versionId || DEFAULT_VERSION_ID;
         this.onSaveData = opts.onSaveData || null;
         this.saveStore = opts.saveStore || createSaveStore();
 
         this.game = null;
-        this.squisher = null;
-        this.dispatcher = null;
-        this.canvas = null;
-        this.container = null;
-        this.assetManager = null;
-        this.renderer = null;
-        this.inputHandler = null;
+        this.runtime = null;
+        this.players = []; // primary first; every seat has the same view/dispatch/frame record
         this.unsquish = null;
         this.aspectRatio = null;
 
-        this.currentBuf = null;
-        this.rendering = false;
         this.frozen = false;     // game ended, view kept for inspection
-        this._frameDirty = false;
-        this._rafId = null;
+        this._loop = new FrameLoop(() => this._paintFrame());
         this._resizeHandler = null;
 
         // Inspector state (see the Inspector API section below)
         this._inspector = null;          // onSnapshot callback while enabled
         this._onInput = null;            // input-event callback while enabled
         this._inspectBuf = null;         // recorded frame pinned to the canvas
-        this._inputDetached = false;     // game input suspended (inspect/pick)
         this._highlight = null;          // halo polygon, 0-100 coordinate space
         this._pick = null;               // pick-mode callbacks while active
-
-        // Extra simulated players (addPlayer): each renders its own
-        // player-scoped frame into its own canvas with its own input pipeline.
-        this.extraPlayers = [];
     }
 
-    start() {
-        // Guards the async save-load gap below: a stop() (or a second start())
-        // during the load must prevent the stale boot from running.
-        this._bootGeneration = (this._bootGeneration || 0) + 1;
+    // Primary-view accessors retain the existing embedding interface without
+    // storing a second copy of resources owned by the view/runtime.
+    get _primary() { return this.players[0]; }
+    get extraPlayers() { return this.players.slice(1); }
+    get view() { return this._primary?.view || null; }
+    get container() { return this.view?.container || null; }
+    get canvas() { return this.view?.canvas || null; }
+    get renderer() { return this.view?.renderer || null; }
+    get assetManager() { return this.view?.assetManager || null; }
+    get inputHandler() { return this.game ? this.view?.inputHandler || null : null; }
+    get dispatcher() { return this._primary?.dispatcher || null; }
+    get currentBuf() { return this._primary?.currentBuf || null; }
+    get squisher() { return this.runtime?.squisher || null; }
+    get rendering() { return this._loop.running; }
 
+    start() {
+        this.stop(); // replace any prior runtime/view before starting again
         // --- Set up DOM ---
-        this.container = document.getElementById(this.containerId);
-        if (!this.container) {
+        const container = document.getElementById(this.containerId);
+        if (!container) {
             this.onError(new Error('Container element not found: #' + this.containerId));
             return;
         }
 
-        this.container.innerHTML = '';
-        this.container.style.position = 'relative';
-        this.container.style.overflow = 'hidden';
-        this.container.style.background = '#000';
-
-        this.canvas = document.createElement('canvas');
-        this.canvas.style.display = 'block';
-        this.canvas.style.margin = '0 auto';
-        this.container.appendChild(this.canvas);
+        container.innerHTML = '';
 
         // --- Load game class from source map if not passed directly ---
         if (!this.gameClass && this.files) {
             try {
                 this.gameClass = loadGameClass({ files: this.files, entryPoint: this.entryPoint });
             } catch (err) {
+                this.stop();
                 this.onError(err);
                 return;
             }
         }
         if (!this.gameClass) {
+            this.stop();
             this.onError(new Error('LocalSession needs either gameClass or files'));
             return;
         }
@@ -176,7 +171,7 @@ class LocalSession {
         const bootGeneration = this._bootGeneration;
         this.saveStore.getSave(saveKey).catch(() => null).then((envelope) => {
             if (bootGeneration !== this._bootGeneration) return; // stopped/restarted mid-load
-            const saveData = (envelope && isCompatibleSave(envelope, DEFAULT_VERSION_ID, compatibility))
+            const saveData = (envelope && isCompatibleSave(envelope, this.versionId, compatibility))
                 ? envelope.data
                 : undefined;
 
@@ -197,16 +192,16 @@ class LocalSession {
                 } catch (err) {
                     return Promise.reject(err);
                 }
-                return writeSave({ gameKey, versionId: DEFAULT_VERSION_ID, savedAt: Date.now(), data: cleaned });
+                return writeSave({ gameKey, versionId: this.versionId, savedAt: Date.now(), data: cleaned });
             };
 
-            this._boot({ squishModule, saveGame, saveData });
+            this._boot({ container, squishModule, saveGame, saveData });
         });
     }
 
     // Second half of start(): runs once the stored save (if any) has loaded,
     // because the game constructor takes saveData directly.
-    _boot({ squishModule, saveGame, saveData }) {
+    _boot({ container, squishModule, saveGame, saveData }) {
         // --- Instantiate game + squisher ---
         try {
             // Same option bag child_game_server passes; platform services are
@@ -218,71 +213,27 @@ class LocalSession {
                 saveData,
                 services: {},
             });
-            // The Squisher starts the game's tick loop and registers itself as
-            // a state listener on every node — identical to a hosted session.
+            // The runtime owns ticking; Squish owns scene serialization.
             // Frameless: no custom layers, scale 1.
-            this.squisher = new squishModule.Squisher({ game: this.game });
+            this.runtime = createLocalRuntime(squishModule.Squisher, this.game);
         } catch (err) {
+            this.stop();
             this.onError(err);
             return;
         }
 
-        this.dispatcher = new LocalDispatcher(this.game, this.playerId);
-
-        // --- Set up subsystems (identical wiring to HomegamesClient, with
-        // the dispatcher standing in for the socket send function) ---
-        this.assetManager = new AssetManager();
-        this.assetManager.onAssetReady = () => { this._frameDirty = true; };
-        this.renderer = new Renderer(this.canvas, this.assetManager);
-        this.inputHandler = new InputHandler(
-            this.canvas,
-            (msg) => {
-                this._noteInput(msg);
-                this.dispatcher.handleMessage(msg);
-            },
-            () => this.renderer.thingIndices,
-            this.assetManager
-        );
-        this.inputHandler.squishVersion = this.squishVersion;
-        this.inputHandler.attach();
-
-        this._resizeHandler = () => this._initCanvas();
-        window.addEventListener('resize', this._resizeHandler);
-        this._initCanvas();
-
-        if (this.assetBundle) {
-            this.assetManager.storeAssets(this.assetBundle);
-        }
-
-        // --- State changes -> new local frame ---
-        // The squisher coalesces node mutations and fires listeners once per
-        // flush, so this is already one capture per burst. Tree changes can
-        // remove a node mid-drag, so close out any orphaned press first
-        // (safe here: ending a press deletes it before offClick fires, so a
-        // re-entrant flush from offClick's own mutations no-ops).
+        const runtime = this.runtime;
         this.squisher.addListener(() => {
-            if (this.dispatcher) this.dispatcher.checkActivePresses();
-            this.extraPlayers.forEach(p => p.dispatcher.checkActivePresses());
+            if (this.runtime !== runtime) return; // ignore a queued flush from an ended game
+            this.players.forEach(player => player.dispatcher?.checkActivePresses());
             this._captureFrame();
         });
-
-        // --- Fake local player joins (same payload shape the server builds) ---
-        const playerPayload = {
-            playerId: this.playerId,
-            settings: { SOUND: true },
-            info: { name: this.playerName },
-            clientInfo: this._getClientInfo(),
-            requestedGame: null,
-        };
-        try {
-            this.game.handleNewPlayer && this.game.handleNewPlayer(playerPayload);
-        } catch (e) {
-            console.error('[LocalSession] game.handleNewPlayer threw:', e);
-        }
-
+        this._joinPlayer(container, this.playerId, this.playerName, this.gamepadOptions);
+        if (this.assetBundle) this.assetManager.storeAssets(this.assetBundle);
+        this._resizeHandler = () => this._initCanvas();
+        window.addEventListener('resize', this._resizeHandler);
         this._captureFrame();
-        this.rendering = true;
-        this._renderLoop();
+        this._loop.start();
         this.onReady(this.playerId);
     }
 
@@ -320,7 +271,7 @@ class LocalSession {
     resumeLive() {
         this._inspectBuf = null;
         this._updateInputAttachment();
-        this._frameDirty = true;
+        if (this._primary) this._primary.frameDirty = true;
     }
 
     // Pick mode: the pointer roams the primary canvas reporting 0-100 coords
@@ -368,15 +319,9 @@ class LocalSession {
     // The primary player's game input is suspended while a recorded frame is
     // pinned or pick mode is active. Extra players are unaffected.
     _updateInputAttachment() {
-        if (!this.inputHandler) return;
-        const shouldDetach = !!this._inspectBuf || !!this._pick;
-        if (shouldDetach && !this._inputDetached) {
-            this.inputHandler.detach();
-            this._inputDetached = true;
-        } else if (!shouldDetach && this._inputDetached) {
-            this.inputHandler.attach();
-            this._inputDetached = false;
-        }
+        if (!this.inputHandler) return; // frozen/stopped sessions cannot resume input
+        if (this._inspectBuf || this._pick) this.inputHandler.detach();
+        else this.inputHandler.attach();
     }
 
     // Inspector timeline: note primary-player inputs as they head into the
@@ -399,7 +344,7 @@ class LocalSession {
     setHighlight(points) {
         this._highlight = (points && points.length) ? points : null;
         if (this._inspectBuf) this._paintInspectedFrame();
-        else this._frameDirty = true;
+        else if (this._primary) this._primary.frameDirty = true;
     }
 
     _paintInspectedFrame() {
@@ -452,7 +397,7 @@ class LocalSession {
     // per-player interaction behave like a real multi-device session. Audio
     // stays with the primary player — two renderers would double-play every
     // sound. Returns the new playerId, or null.
-    addPlayer(containerId) {
+    addPlayer(containerId, { gamepadIndex } = {}) {
         if (!this.game || !this.squisher) return null;
         const container = document.getElementById(containerId);
         if (!container) {
@@ -460,69 +405,58 @@ class LocalSession {
             return null;
         }
 
-        const used = [this.playerId, ...this.extraPlayers.map(p => p.playerId)];
-        const playerId = Math.max(...used) + 1;
-
-        container.innerHTML = '';
-        container.style.position = 'relative';
-        container.style.overflow = 'hidden';
-        container.style.background = '#000';
-        const canvas = document.createElement('canvas');
-        canvas.style.display = 'block';
-        canvas.style.margin = '0 auto';
-        container.appendChild(canvas);
-
-        const renderer = new Renderer(canvas, this.assetManager);
-        const dispatcher = new LocalDispatcher(this.game, playerId);
-        const inputHandler = new InputHandler(
-            canvas,
-            (msg) => dispatcher.handleMessage(msg),
-            () => renderer.thingIndices,
-            this.assetManager
-        );
-        inputHandler.squishVersion = this.squishVersion;
-        inputHandler.attach();
-
-        const player = {
-            playerId,
-            container,
-            canvas,
-            renderer,
-            dispatcher,
-            inputHandler,
-            playerName: generateName(),
-            currentBuf: null,
-            frameDirty: false,
-        };
-        this.extraPlayers.push(player);
-        this._sizeCanvas(player);
-
-        try {
-            this.game.handleNewPlayer && this.game.handleNewPlayer({
-                playerId,
-                settings: { SOUND: true },
-                info: { name: player.playerName },
-                clientInfo: this._getClientInfo(),
-                requestedGame: null,
-            });
-        } catch (e) {
-            console.error('[LocalSession] game.handleNewPlayer threw for extra player:', e);
+        const playerId = Math.max(...this.players.map(p => p.playerId)) + 1;
+        // Split controllers between seats; explicit indices support sparse pad lists.
+        const primaryPads = this.inputHandler?.gamepads;
+        if (primaryPads && primaryPads.index === null) primaryPads.setIndex(0);
+        const usedIndices = new Set(this.players.map(p => p.view.inputHandler.gamepads?.index));
+        if (gamepadIndex === undefined) {
+            gamepadIndex = 0;
+            while (usedIndices.has(gamepadIndex)) gamepadIndex++;
         }
-
+        this._joinPlayer(container, playerId, generateName(),
+            this.gamepadOptions === false ? false : { ...this.gamepadOptions, index: gamepadIndex });
         this._captureFrame();
         return playerId;
     }
 
-    removePlayer(playerId) {
-        const idx = this.extraPlayers.findIndex(p => p.playerId === playerId);
-        if (idx === -1) return;
-        const player = this.extraPlayers.splice(idx, 1)[0];
+    _joinPlayer(container, playerId, playerName, gamepad) {
+        const dispatcher = new LocalDispatcher(this.game, playerId);
+        const view = new GameView({
+            container, assetManager: this.assetManager, gamepad,
+            send: msg => {
+                if (playerId === this.playerId) this._noteInput(msg);
+                dispatcher.handleMessage(msg);
+            },
+            onAssetReady: () => this._invalidateFrames(),
+        });
+        this.players.push({ playerId, view, dispatcher, currentBuf: null, frameDirty: true });
+        view.inputHandler.squishVersion = this.squishVersion;
+        view.resize(this.aspectRatio);
         try {
-            this.game && this.game.handlePlayerDisconnect && this.game.handlePlayerDisconnect(playerId);
-        } catch (e) {}
-        player.inputHandler.detach();
-        player.renderer.stopAllSounds();
-        player.container.innerHTML = '';
+            this.game.handleNewPlayer?.({ playerId, settings: { SOUND: true },
+                info: { name: playerName }, clientInfo: getClientInfo(), requestedGame: null });
+        } catch (e) {
+            console.error('[LocalSession] game.handleNewPlayer threw:', e);
+        }
+    }
+
+    _leavePlayer(player) {
+        const dispatcher = player.dispatcher;
+        if (!dispatcher) return; // already left, including freeze() followed by stop()
+        player.dispatcher = null;
+        player.view.inputHandler.detach();
+        dispatcher.release();
+        try { this.game?.handlePlayerDisconnect?.(player.playerId); } catch (e) {}
+        player.view.renderer.stopAllSounds();
+    }
+
+    removePlayer(playerId) {
+        const index = this.players.findIndex(p => p.playerId === playerId);
+        if (index <= 0) return; // the primary view lives until the session ends
+        const [player] = this.players.splice(index, 1);
+        this._leavePlayer(player);
+        player.view.destroy();
     }
 
     // JSON-safe copy of a GameNode subtree — enough to render a tree view and
@@ -565,96 +499,36 @@ class LocalSession {
     freeze() {
         if (this.frozen) return;
         this.frozen = true;
+        this._endGame();
+    }
 
-        if (this.game) {
-            this.extraPlayers.forEach(player => {
-                try { this.game.handlePlayerDisconnect && this.game.handlePlayerDisconnect(player.playerId); } catch (e) {}
-            });
-            try { this.game.handlePlayerDisconnect && this.game.handlePlayerDisconnect(this.playerId); } catch (e) {}
-            try { this.game.close && this.game.close(); } catch (e) {}
-            try { this.game.destroy && this.game.destroy(); } catch (e) {}
-            this.game = null;
-        }
-
-        if (this.squisher && this.squisher._tickInterval) {
-            clearInterval(this.squisher._tickInterval);
-        }
-        this.squisher = null;
-
-        if (this.inputHandler) {
-            this.inputHandler.detach();
-            this.inputHandler = null;
-        }
-        this.dispatcher = null;
-        this.extraPlayers.forEach(player => {
-            player.inputHandler.detach();
-            player.renderer.stopAllSounds();
-        });
-
-        if (this.renderer) this.renderer.stopAllSounds();
+    // Both freeze and stop end exactly the same runtime. Views outlive the
+    // game only when frozen, so inspector recordings remain available.
+    _endGame() {
+        this._bootGeneration = (this._bootGeneration || 0) + 1;
+        this.runtime?.stop();
+        this.runtime = null;
+        this.players.forEach(player => this._leavePlayer(player));
+        try { this.game?.close?.(); } catch (e) {}
+        try { this.game?.destroy?.(); } catch (e) {}
+        this.game = null;
     }
 
     stop() {
-        this._bootGeneration = (this._bootGeneration || 0) + 1; // cancel a pending _boot
-        this.rendering = false;
-        this.frozen = false;
+        this._endGame();
+        this._loop.stop();
         this.disablePick();
         this._inspector = null;
         this._onInput = null;
         this._inspectBuf = null;
-        this._inputDetached = false;
         this._highlight = null;
-
-        this.extraPlayers.forEach(player => {
-            try { this.game && this.game.handlePlayerDisconnect && this.game.handlePlayerDisconnect(player.playerId); } catch (e) {}
-            player.inputHandler.detach();
-            player.renderer.stopAllSounds();
-            player.container.innerHTML = '';
-        });
-        this.extraPlayers = [];
-
-        if (this._rafId) {
-            cancelAnimationFrame(this._rafId);
-            this._rafId = null;
-        }
-
-        if (this.game) {
-            try { this.game.handlePlayerDisconnect && this.game.handlePlayerDisconnect(this.playerId); } catch (e) {}
-            try { this.game.close && this.game.close(); } catch (e) {}
-            try { this.game.destroy && this.game.destroy(); } catch (e) {}
-            this.game = null;
-        }
-
-        // End the Squisher's tick loop so repeated start/stop cycles — e.g.
-        // Studio hot reload — don't accumulate running tick intervals driving
-        // dead games.
-        if (this.squisher && this.squisher._tickInterval) {
-            clearInterval(this.squisher._tickInterval);
-        }
-        this.squisher = null;
-
-        if (this.inputHandler) {
-            this.inputHandler.detach();
-            this.inputHandler = null;
-        }
-
-        if (this.renderer) {
-            this.renderer.stopAllSounds();
-            this.renderer = null;
-        }
-
-        if (this.assetManager) {
-            this.assetManager.destroy();
-            this.assetManager = null;
-        }
-
+        this.frozen = false;
+        // Borrowed views go first; the primary owns their shared asset store.
+        [...this.players].reverse().forEach(player => player.view.destroy());
+        this.players = [];
         if (this._resizeHandler) {
             window.removeEventListener('resize', this._resizeHandler);
             this._resizeHandler = null;
-        }
-
-        if (this.container) {
-            this.container.innerHTML = '';
         }
     }
 
@@ -671,7 +545,7 @@ class LocalSession {
             const data = asset && asset.data;
             if (data && this.assetManager) {
                 this.assetManager.storeRawAsset(key, type, data);
-                this._frameDirty = true;
+                this._invalidateFrames();
             }
         } catch (err) {
             console.error('[LocalSession] addAsset failed:', err);
@@ -683,128 +557,48 @@ class LocalSession {
     // player-scoped frame, fall back to the broadcast state when the player
     // has no scoped nodes anywhere in the tree.
     _captureFrame() {
-        if (!this.squisher) return;
-        if (typeof this.squisher.flush === 'function') this.squisher.flush();
+        const squisher = this.squisher;
+        if (!squisher) return;
+        squisher.flush?.();
+        if (this.squisher !== squisher) return; // a snapshot callback may end the game
 
-        this.extraPlayers.forEach(player => {
-            let pFrame = this.squisher.getPlayerFrame(player.playerId);
-            if (!pFrame) pFrame = this.squisher.state;
-            if (!pFrame || !pFrame.length) return;
-            const pFlat = Array.isArray(pFrame) ? pFrame.flat() : pFrame;
-            player.currentBuf = new Uint8ClampedArray(Buffer.from(pFlat));
+        for (const player of this.players) {
+            const frame = squisher.getPlayerFrame(player.playerId) || squisher.state;
+            if (!frame?.length) continue;
+            // Squish emits fractional values for integer bytes. Match the
+            // hosted Buffer truncation; Uint8ClampedArray alone would round.
+            player.currentBuf = new Uint8ClampedArray(Buffer.from(Array.isArray(frame) ? frame.flat() : frame));
             player.frameDirty = true;
-        });
-
-        let frame = this.squisher.getPlayerFrame(this.playerId);
-        if (!frame) frame = this.squisher.state;
-        if (!frame || !frame.length) return;
-        const flat = Array.isArray(frame) ? frame.flat() : frame;
-        // Buffer.from is load-bearing, not just a container: squish's scaled
-        // coordinate path emits raw floats for the integer byte and relies on
-        // the wire's Buffer truncation to floor them. Uint8ClampedArray ROUNDS
-        // instead, shifting any vertex with fractional part >= .5 by a full
-        // plane unit (visible as polygon wobble). Truncate exactly like the
-        // server's ws send path does.
-        this.currentBuf = new Uint8ClampedArray(Buffer.from(flat));
-        this._frameDirty = true;
+        }
         this._emitSnapshot();
     }
 
-    _initCanvas() {
-        if (!this.aspectRatio || !this.container) return;
-        this._sizeCanvas({ canvas: this.canvas, container: this.container, inputHandler: this.inputHandler });
-        this.extraPlayers.forEach(player => {
-            this._sizeCanvas(player);
-            player.frameDirty = true;
-        });
+    _invalidateFrames() {
+        this.players.forEach(player => { player.frameDirty = true; });
+    }
 
-        // Resizing clears the canvas, so the current frame must be repainted.
-        this._frameDirty = true;
+    _initCanvas() {
+        this.players.forEach(player => player.view.resize(this.aspectRatio));
+        this._invalidateFrames();
         if (this._inspectBuf) this._paintInspectedFrame();
     }
 
-    // Fit a canvas to its container at the game's aspect ratio (any player's
-    // view — primary or extra).
-    _sizeCanvas({ canvas, container, inputHandler }) {
-        if (!this.aspectRatio || !canvas || !container) return;
-
-        const maxWidth = container.clientWidth || window.innerWidth;
-        const maxHeight = container.clientHeight || window.innerHeight;
-
-        const canFitHeight = (maxWidth * this.aspectRatio.y / this.aspectRatio.x) <= maxHeight;
-
-        let canvasWidth, canvasHeight;
-
-        if (canFitHeight) {
-            canvasWidth = maxWidth;
-            canvasHeight = Math.floor(maxWidth * (this.aspectRatio.y / this.aspectRatio.x));
-        } else {
-            canvasHeight = maxHeight;
-            canvasWidth = Math.floor(maxHeight * (this.aspectRatio.x / this.aspectRatio.y));
-        }
-
-        // Use 2x resolution for crisp rendering
-        canvas.width = 2 * canvasWidth;
-        canvas.height = 2 * canvasHeight;
-        canvas.style.width = canvasWidth + 'px';
-        canvas.style.height = canvasHeight + 'px';
-
-        if (inputHandler) {
-            inputHandler.clientWidth = canvasWidth;
-            inputHandler.clientHeight = canvasHeight;
-        }
-    }
-
-    _renderLoop() {
-        if (!this.rendering) return;
-
-        if (this.inputHandler) {
-            this.inputHandler.tick();
-        }
-
-        // While the inspector has a recorded frame pinned, live frames keep
-        // being captured but not painted; the dirty flag is dropped because
-        // resumeLive() re-marks it.
-        if (this._frameDirty && this.currentBuf && this.currentBuf.length > 1 && this.currentBuf[0] === 3 && this.unsquish) {
-            if (!this._inspectBuf) {
-                this.renderer.renderFrame(this.currentBuf, this.unsquish);
-                this._drawHighlight();
+    _paintFrame() {
+        for (const player of this.players) {
+            const { view } = player;
+            if (player.dispatcher) view.inputHandler.tick();
+            if (view.destroyed) continue; // input can stop the session or remove this seat
+            const { currentBuf } = player; // input can synchronously update the frame
+            if (!player.frameDirty || !currentBuf || currentBuf.length <= 1 || currentBuf[0] !== 3) continue;
+            const primary = player === this._primary;
+            if (!primary || !this._inspectBuf) {
+                view.renderer.renderFrame(currentBuf, this.unsquish, { muteAudio: !primary || this.frozen });
+                if (primary) this._drawHighlight();
             }
-            this._frameDirty = false;
+            player.frameDirty = false;
         }
-
-        this.extraPlayers.forEach(player => {
-            player.inputHandler.tick();
-            if (player.frameDirty && player.currentBuf && player.currentBuf.length > 1 && player.currentBuf[0] === 3) {
-                // Audio belongs to the primary view — see addPlayer
-                player.renderer.renderFrame(player.currentBuf, this.unsquish, { muteAudio: true });
-                player.frameDirty = false;
-            }
-        });
-
-        this._rafId = requestAnimationFrame(() => this._renderLoop());
     }
 
-    _getClientInfo() {
-        const ua = navigator.userAgent;
-        const info = {};
-
-        if (/(tablet|ipad|playbook|silk)|(android(?!.*mobi))/i.test(ua)) {
-            info.deviceType = 'tablet';
-        } else if (/Mobile|iP(hone|od)|Android|BlackBerry|IEMobile|Kindle|Silk-Accelerated|(hpw|web)OS|Opera M(obi|ini)/.test(ua)) {
-            info.deviceType = 'mobile';
-        } else if (navigator.maxTouchPoints && navigator.maxTouchPoints > 2) {
-            info.deviceType = 'tablet';
-        } else {
-            info.deviceType = 'desktop';
-        }
-
-        const w = window.innerWidth;
-        const h = window.innerHeight;
-        if (w && h) info.aspectRatio = w / h;
-
-        return info;
-    }
 }
 
 module.exports = LocalSession;

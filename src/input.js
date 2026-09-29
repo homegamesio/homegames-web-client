@@ -6,8 +6,7 @@
  * to determine what was clicked and whether to show text/file input prompts.
  */
 
-let Homepad = null;
-try { Homepad = require('homepad').Homepad; } catch (e) { /* optional */ }
+const GamepadInput = require('./gamepad-input');
 
 const { fitImageToSize } = require('./image-fit');
 
@@ -29,7 +28,7 @@ const uint8ToBase64 = (bytes) => {
 };
 
 class InputHandler {
-    constructor(canvas, sendFn, getThingIndices, assetManager) {
+    constructor(canvas, sendFn, getThingIndices, assetManager, gamepadOptions = {}) {
         this.canvas = canvas;
         this.send = sendFn;
         this.getThingIndices = getThingIndices;
@@ -53,16 +52,14 @@ class InputHandler {
         this._boundHandlers = {};
         this._attached = false;
 
-        // Gamepad support (via homepad if available)
-        this._homepad = null;
-        if (Homepad) {
-            try { this._homepad = new Homepad(); } catch (e) { /* no window */ }
-        }
+        this.gamepads = gamepadOptions === false ? null : new GamepadInput(sendFn, gamepadOptions);
+        this._focused = true;
     }
 
     attach() {
         if (this._attached) return;
         this._attached = true;
+        this._focused = typeof document.hasFocus !== 'function' || document.hasFocus();
 
         const h = this._boundHandlers;
 
@@ -76,9 +73,10 @@ class InputHandler {
         };
 
         h.mouseup = (e) => {
-            this.mouseDown = false;
             this.mousePos = [e.clientX, e.clientY];
             this._lastClientPos = [e.clientX, e.clientY];
+            this._sendPendingClick(this._canClick(e.clientX, e.clientY));
+            this.mouseDown = false;
             this._sendMouseUp(e.clientX, e.clientY);
         };
 
@@ -123,7 +121,6 @@ class InputHandler {
         h.touchend = (e) => {
             // Releases of touches we never claimed (page UI taps) aren't ours
             if (!this._touchActive) return;
-            this.mouseDown = false;
             // touches is empty by touchend; the lifted finger is in changedTouches.
             const touch = e.changedTouches && e.changedTouches[0];
             if (touch) {
@@ -138,9 +135,14 @@ class InputHandler {
                 );
                 if (clickInfo.action === 'file') {
                     this._promptFileUpload(clickInfo.nodeId);
+                } else {
+                    this.mousePos = [touch.clientX, touch.clientY];
+                    this._sendPendingClick(clickInfo);
                 }
+                this.mouseDown = false;
                 this._sendMouseUp(touch.clientX, touch.clientY);
             }
+            this.mouseDown = false;
         };
 
         h.touchcancel = () => {
@@ -193,6 +195,9 @@ class InputHandler {
         };
 
         h.blur = () => {
+            this._focused = false;
+            this.gamepads?.release();
+            this._releaseKeys();
             // Window lost focus (alt-tab, switched app) while the button was
             // held — we won't get the mouseup, so clear the held state and
             // tell the server the press ended where we last saw the pointer.
@@ -202,10 +207,20 @@ class InputHandler {
             this.mouseDown = false;
         };
 
+        h.focus = () => { this._focused = true; };
+        h.visibilitychange = () => {
+            if (document.hidden) {
+                this.gamepads?.release();
+                this._releaseKeys();
+            }
+        };
+
         window.addEventListener('mousedown', h.mousedown);
         window.addEventListener('mouseup', h.mouseup);
         window.addEventListener('mousemove', h.mousemove);
         window.addEventListener('blur', h.blur);
+        window.addEventListener('focus', h.focus);
+        document.addEventListener('visibilitychange', h.visibilitychange);
         window.addEventListener('touchstart', h.touchstart, { passive: false });
         this.canvas.addEventListener('touchmove', h.touchmove, { passive: false });
         window.addEventListener('touchend', h.touchend);
@@ -217,12 +232,16 @@ class InputHandler {
     detach() {
         if (!this._attached) return;
         this._attached = false;
+        this.gamepads?.release();
+        this._releaseKeys();
 
         const h = this._boundHandlers;
         window.removeEventListener('mousedown', h.mousedown);
         window.removeEventListener('mouseup', h.mouseup);
         window.removeEventListener('mousemove', h.mousemove);
         window.removeEventListener('blur', h.blur);
+        window.removeEventListener('focus', h.focus);
+        document.removeEventListener('visibilitychange', h.visibilitychange);
         window.removeEventListener('touchstart', h.touchstart);
         this.canvas.removeEventListener('touchmove', h.touchmove);
         window.removeEventListener('touchend', h.touchend);
@@ -236,6 +255,7 @@ class InputHandler {
      * handles held keys, and performs click/hover logic.
      */
     tick() {
+        if (!this._attached) return;
         // Repeat held keys at a fixed cadence, decoupled from the rAF frame
         // rate (which can be 120Hz+ on high-refresh displays and would otherwise
         // blow the server's input rate limit).
@@ -247,27 +267,8 @@ class InputHandler {
             }
         });
 
-        // Poll gamepads (throttled — only send when state changes)
-        if (this._homepad) {
-            try {
-                const gamepads = this._homepad.getGamepads();
-                if (gamepads && gamepads.length) {
-                    gamepads.forEach((gp) => {
-                        const state = this._homepad.getGamepadState(gp.index);
-                        const stateStr = JSON.stringify(state);
-                        if (!this._lastGamepadState || this._lastGamepadState[gp.index] !== stateStr) {
-                            if (!this._lastGamepadState) this._lastGamepadState = {};
-                            this._lastGamepadState[gp.index] = stateStr;
-                            this.send(JSON.stringify({
-                                type: 'input',
-                                gamepad: true,
-                                input: state,
-                            }));
-                        }
-                    });
-                }
-            } catch (e) { /* ignore gamepad errors */ }
-        }
+        if (this._focused && !document.hidden && !this.spectating) this.gamepads?.tick();
+        else this.gamepads?.release();
 
         if (!this.mousePos) return;
 
@@ -318,6 +319,16 @@ class InputHandler {
 
     // --- Private ---
 
+    _releaseKeys() {
+        for (const timer of Object.values(this._keyUpTimers || {})) clearTimeout(timer);
+        this._keyUpTimers = {};
+        for (const key of Object.keys(this.keysDown)) {
+            if (this.keysDown[key]) this.send(JSON.stringify({ type: 'keyup', key }));
+        }
+        this.keysDown = {};
+        this._lastKeyRepeat = {};
+    }
+
     _keyMatters(event) {
         return (event.key.length === 1 && event.key >= ' ' && event.key <= 'z') ||
             (event.keyCode >= 36 && event.keyCode <= 40) ||
@@ -365,6 +376,14 @@ class InputHandler {
 
     _offHover(nodeId) {
         this.send(JSON.stringify({ type: 'offhover', nodeId }));
+    }
+
+    // A press can begin and end between two animation frames. Deliver it before
+    // its release, without duplicating a click already sent by tick().
+    _sendPendingClick(clickInfo) {
+        if (!this.mouseDown || this._pressClickSent || this.spectating || !this._focused) return;
+        this._pressClickSent = true;
+        this._handleClick(clickInfo, true);
     }
 
     _handleClick(clickInfo, isNewPress) {
