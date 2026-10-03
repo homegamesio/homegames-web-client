@@ -1,4 +1,6 @@
 const createLocalRuntime = require('./local-game-runtime');
+const { playerFrame } = require('homegames-common/session-runtime');
+const { packAssetBundle } = require('./asset-bundle');
 const { GameView, FrameLoop, getClientInfo } = require('./game-view');
 /**
  * LocalSession — runs a Homegames game entirely in the browser, no server.
@@ -10,8 +12,9 @@ const { GameView, FrameLoop, getClientInfo } = require('./game-view');
  * point of view this looks like a normal connected session.
  *
  * One simulated player (default id 1) joins at start(); addPlayer() creates
- * extra views of the same game for Studio testing. This provides no networking
- * or Homenames identity. Games requiring server-only services cannot run here.
+ * extra views of the same game for Studio testing. addRemotePlayer() attaches
+ * a transport-backed seat to that same runtime, without Homenames identity.
+ * Games requiring server-only services cannot run here.
  *
  * Usage:
  *   const session = new LocalSession({
@@ -92,6 +95,8 @@ class LocalSession {
         this.game = null;
         this.runtime = null;
         this.players = []; // primary first; every seat has the same view/dispatch/frame record
+        this.dynamicAssets = new Map();
+        this.onStop = null;
         this.unsquish = null;
         this.aspectRatio = null;
 
@@ -151,6 +156,7 @@ class LocalSession {
 
         // --- Resolve squish version from game metadata ---
         const metadata = (typeof this.gameClass.metadata === 'function') ? this.gameClass.metadata() : {};
+        this.maxPlayers = Math.min(255, metadata.maxPlayers || 64);
         const squishVersion = metadata.squishVersion || DEFAULT_VERSION;
         let squishModule = squishMap[squishVersion];
         if (!squishModule) {
@@ -230,6 +236,7 @@ class LocalSession {
         });
         this._joinPlayer(container, this.playerId, this.playerName, this.gamepadOptions);
         if (this.assetBundle) this.assetManager.storeAssets(this.assetBundle);
+        for (const asset of this.dynamicAssets.values()) this.assetManager.storeRawAsset(asset.key, asset.type, asset.data);
         this._resizeHandler = () => this._initCanvas();
         window.addEventListener('resize', this._resizeHandler);
         this._captureFrame();
@@ -409,7 +416,7 @@ class LocalSession {
         // Split controllers between seats; explicit indices support sparse pad lists.
         const primaryPads = this.inputHandler?.gamepads;
         if (primaryPads && primaryPads.index === null) primaryPads.setIndex(0);
-        const usedIndices = new Set(this.players.map(p => p.view.inputHandler.gamepads?.index));
+        const usedIndices = new Set(this.players.map(p => p.view?.inputHandler.gamepads?.index));
         if (gamepadIndex === undefined) {
             gamepadIndex = 0;
             while (usedIndices.has(gamepadIndex)) gamepadIndex++;
@@ -445,10 +452,10 @@ class LocalSession {
         const dispatcher = player.dispatcher;
         if (!dispatcher) return; // already left, including freeze() followed by stop()
         player.dispatcher = null;
-        player.view.inputHandler.detach();
+        player.view?.inputHandler.detach();
         dispatcher.release();
         try { this.game?.handlePlayerDisconnect?.(player.playerId); } catch (e) {}
-        player.view.renderer.stopAllSounds();
+        player.view?.renderer.stopAllSounds();
     }
 
     removePlayer(playerId) {
@@ -456,7 +463,34 @@ class LocalSession {
         if (index <= 0) return; // the primary view lives until the session ends
         const [player] = this.players.splice(index, 1);
         this._leavePlayer(player);
-        player.view.destroy();
+        player.view?.destroy();
+        player.close?.();
+    }
+
+    // A remote seat uses the same game, dispatcher and frame capture as a
+    // local view. Its transport owns rendering on the other device.
+    addRemotePlayer({ send, close, clientInfo = {} }) {
+        if (!this.game || this.frozen) throw new Error('The host game has ended');
+        if (this.players.length >= this.maxPlayers) throw new Error('This game is full');
+        let playerId = 1;
+        while (this.players.some(p => p.playerId === playerId)) playerId++;
+        const version = Array.from(this.squishVersion, c => c.charCodeAt(0));
+        send(Uint8Array.from([2, playerId, this.aspectRatio.x, this.aspectRatio.y, 0, 0, version.length, ...version]));
+        if (this.assetBundle) send(this.assetBundle);
+        if (this.dynamicAssets.size) send(packAssetBundle([...this.dynamicAssets.values()]));
+        const dispatcher = new LocalDispatcher(this.game, playerId);
+        const player = { playerId, dispatcher, send, close, view: null, currentBuf: null, frameDirty: true };
+        this.players.push(player);
+        try {
+            this.game.handleNewPlayer?.({ playerId, settings: { SOUND: true },
+                info: { name: generateName() }, clientInfo, requestedGame: null });
+            this._captureFrame();
+        } catch (err) { this.removePlayer(playerId); throw err; }
+        return {
+            playerId,
+            handleMessage: message => { if (player.dispatcher) player.dispatcher.handleMessage(message); },
+            leave: () => this.removePlayer(playerId),
+        };
     }
 
     // JSON-safe copy of a GameNode subtree — enough to render a tree view and
@@ -506,6 +540,9 @@ class LocalSession {
     // game only when frozen, so inspector recordings remain available.
     _endGame() {
         this._bootGeneration = (this._bootGeneration || 0) + 1;
+        const onStop = this.onStop;
+        this.onStop = null;
+        onStop?.();
         this.runtime?.stop();
         this.runtime = null;
         this.players.forEach(player => this._leavePlayer(player));
@@ -524,8 +561,9 @@ class LocalSession {
         this._highlight = null;
         this.frozen = false;
         // Borrowed views go first; the primary owns their shared asset store.
-        [...this.players].reverse().forEach(player => player.view.destroy());
+        [...this.players].reverse().forEach(player => { player.view?.destroy(); player.close?.(); });
         this.players = [];
+        this.dynamicAssets.clear();
         if (this._resizeHandler) {
             window.removeEventListener('resize', this._resizeHandler);
             this._resizeHandler = null;
@@ -543,8 +581,11 @@ class LocalSession {
         try {
             const type = (asset && asset.info && asset.info.type) || 'image';
             const data = asset && asset.data;
-            if (data && this.assetManager) {
-                this.assetManager.storeRawAsset(key, type, data);
+            if (data) {
+                this.dynamicAssets.set(key, { key, type, data });
+                this.assetManager?.storeRawAsset(key, type, data);
+                const bundle = packAssetBundle([{ key, type, data }]);
+                this.players.forEach(player => player.send?.(bundle));
                 this._invalidateFrames();
             }
         } catch (err) {
@@ -563,12 +604,13 @@ class LocalSession {
         if (this.squisher !== squisher) return; // a snapshot callback may end the game
 
         for (const player of this.players) {
-            const frame = squisher.getPlayerFrame(player.playerId) || squisher.state;
+            const frame = playerFrame(squisher, player.playerId);
             if (!frame?.length) continue;
             // Squish emits fractional values for integer bytes. Match the
             // hosted Buffer truncation; Uint8ClampedArray alone would round.
-            player.currentBuf = new Uint8ClampedArray(Buffer.from(Array.isArray(frame) ? frame.flat() : frame));
+            player.currentBuf = frame;
             player.frameDirty = true;
+            player.send?.(frame);
         }
         this._emitSnapshot();
     }
@@ -578,7 +620,7 @@ class LocalSession {
     }
 
     _initCanvas() {
-        this.players.forEach(player => player.view.resize(this.aspectRatio));
+        this.players.forEach(player => player.view?.resize(this.aspectRatio));
         this._invalidateFrames();
         if (this._inspectBuf) this._paintInspectedFrame();
     }
@@ -586,6 +628,7 @@ class LocalSession {
     _paintFrame() {
         for (const player of this.players) {
             const { view } = player;
+            if (!view) continue;
             if (player.dispatcher) view.inputHandler.tick();
             if (view.destroyed) continue; // input can stop the session or remove this seat
             const { currentBuf } = player; // input can synchronously update the frame
