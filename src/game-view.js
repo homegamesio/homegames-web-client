@@ -11,7 +11,10 @@ class GameView {
         container.innerHTML = '';
         Object.assign(container.style, { position: 'relative', overflow: 'hidden', background: '#000' });
         this.canvas = document.createElement('canvas');
-        Object.assign(this.canvas.style, { display: 'block', margin: '0 auto' });
+        Object.assign(this.canvas.style, { display: 'block', margin: '0 auto', cursor: 'default' });
+        this.cursor = null;
+        this.cursorOverride = null;
+        this._cursorRaster = null;
         container.appendChild(this.canvas);
         this.ownsAssets = !assetManager;
         this.assetManager = assetManager || new AssetManager();
@@ -20,6 +23,74 @@ class GameView {
         this.inputHandler = new InputHandler(this.canvas, send,
             () => this.renderer.thingIndices, this.assetManager, gamepad);
         this.inputHandler.attach();
+    }
+
+    // Cursor selection belongs to the session/player, independently of hover.
+    // Keep the requested asset key when bytes have not arrived yet, so the
+    // session's asset-ready callback can refresh this view later.
+    setCursor(cursor) {
+        if (this.destroyed) return;
+        if (this.cursor?.assetKey !== cursor?.assetKey
+            || this.cursor?.size?.width !== cursor?.size?.width
+            || this.cursor?.size?.height !== cursor?.size?.height) this._cursorRaster = null;
+        this.cursor = cursor && { assetKey: cursor.assetKey, hotspot: { ...cursor.hotspot },
+            ...(cursor.size ? { size: { ...cursor.size } } : {}) };
+        this.refreshCursor();
+    }
+
+    // Internal UI override used by the Studio picker without changing the
+    // game's selection. Clearing it restores the current session cursor.
+    setCursorOverride(value) {
+        if (this.destroyed) return;
+        this.cursorOverride = value;
+        this.refreshCursor();
+    }
+
+    refreshCursor() {
+        if (this.destroyed) return;
+        // Image loading can notify readiness synchronously. Finish the current
+        // lookup, then refresh again rather than letting the outer call undo
+        // the ready image selected by a nested callback.
+        if (this._refreshingCursor) { this._cursorRefreshPending = true; return; }
+        this._refreshingCursor = true;
+        try {
+            do {
+                this._cursorRefreshPending = false;
+                let value = this.cursorOverride || 'default';
+                const asset = this.cursor && this.assetManager.assets[this.cursor.assetKey];
+                if (this._cursorRaster?.data !== asset?.data) this._cursorRaster = null;
+                if (!this.cursorOverride && asset?.type === 'image' && typeof asset.data === 'string') {
+                    const url = this._cursorImageUrl(asset);
+                    if (url) {
+                        const { x, y } = this.cursor.hotspot;
+                        value = `url("${url}") ${x} ${y}, default`;
+                    }
+                }
+                if (this.canvas.style.cursor !== value) this.canvas.style.cursor = value;
+            } while (this._cursorRefreshPending && !this.destroyed);
+        } finally {
+            this._refreshingCursor = false;
+        }
+    }
+
+    _cursorImageUrl(asset) {
+        if (!this.cursor.size) return asset.data;
+        const image = this.assetManager.getImage(this.cursor.assetKey);
+        if (!image) return null;
+        const { width, height } = this.cursor.size;
+        const cached = this._cursorRaster;
+        if (cached?.data === asset.data && cached.image === image
+            && cached.width === width && cached.height === height) return cached.url;
+        // Only a game-requested size causes rasterization. Hotspots are already
+        // expressed in these output pixels and are never adjusted by the view.
+        const raster = this._cursorRaster = { data: asset.data, image, width, height, url: null };
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = width; canvas.height = height;
+            canvas.getContext('2d').drawImage(image, 0, 0, width, height);
+            raster.url = canvas.toDataURL('image/png');
+        } catch (_) { /* Keep the native default if the image cannot be rasterized. */ }
+        return raster.url;
     }
 
     resize(aspectRatio) {
@@ -39,6 +110,10 @@ class GameView {
     destroy() {
         if (this.destroyed) return;
         this.destroyed = true;
+        this.cursor = null;
+        this.cursorOverride = null;
+        this._cursorRaster = null;
+        this.canvas.style.cursor = 'default';
         this.inputHandler.detach();
         this.renderer.stopAllSounds();
         if (this.ownsAssets) {

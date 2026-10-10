@@ -14,7 +14,7 @@ const { fitImageToSize } = require('./image-fit');
 // wire message (base64 + JSON envelope, ~1.35x the file) safely under the
 // server's 10MB websocket payload cap — oversized messages get the whole
 // connection terminated by ws, not just the message dropped.
-const MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
+const { MAX_UPLOAD_BYTES } = require('homegames-common/media-upload');
 
 // Encode bytes as base64 without blowing the call stack on MB-sized files
 // (String.fromCharCode.apply is limited by max argument count).
@@ -64,6 +64,11 @@ class InputHandler {
         const h = this._boundHandlers;
 
         h.mousedown = (e) => {
+            if (this._isControlEvent(e)) return;
+            // A new physical press must not be swallowed by the previous
+            // press's repeat throttle (especially short push-to-talk bursts).
+            clearTimeout(this.clickStopper); this.clickStopper = null;
+            if (e.target === this.canvas) this.assetManager.liveMedia?.hold('pointer');
             this._touchActive = false;
             this.mouseDown = true;
             this._pressClickSent = false;
@@ -73,6 +78,7 @@ class InputHandler {
         };
 
         h.mouseup = (e) => {
+            this.assetManager.liveMedia?.release('pointer');
             this.mousePos = [e.clientX, e.clientY];
             this._lastClientPos = [e.clientX, e.clientY];
             this._sendPendingClick(this._canClick(e.clientX, e.clientY));
@@ -86,6 +92,7 @@ class InputHandler {
             // fire. Clear the stale state so we don't fire phantom clicks when
             // the pointer re-enters the canvas.
             if (this.mouseDown && e.buttons === 0) {
+                this.assetManager.liveMedia?.release('pointer');
                 this.mouseDown = false;
             }
             this.mousePos = [e.clientX + window.scrollX, e.clientY + window.scrollY];
@@ -104,6 +111,8 @@ class InputHandler {
             }
             e.preventDefault();
             this._touchActive = true;
+            clearTimeout(this.clickStopper); this.clickStopper = null;
+            this.assetManager.liveMedia?.hold('pointer');
             this.mouseDown = true;
             this._pressClickSent = false;
             this.mousePos = [e.touches[0].clientX + window.scrollX, e.touches[0].clientY + window.scrollY];
@@ -119,6 +128,7 @@ class InputHandler {
         };
 
         h.touchend = (e) => {
+            this.assetManager.liveMedia?.release('pointer');
             // Releases of touches we never claimed (page UI taps) aren't ours
             if (!this._touchActive) return;
             // touches is empty by touchend; the lifted finger is in changedTouches.
@@ -146,6 +156,7 @@ class InputHandler {
         };
 
         h.touchcancel = () => {
+            this.assetManager.liveMedia?.release('pointer');
             // Touch was taken over by the OS (gesture, notification shade) —
             // report the release at the last known position so the server can
             // close out the press (drag-end / offClick).
@@ -156,6 +167,10 @@ class InputHandler {
         };
 
         h.keydown = (e) => {
+            // Frame controls own Enter/Space and text input. Do not let the
+            // document-level game listener cancel their native activation.
+            if (this._isControlEvent(e)) return;
+            if (e.key === ' ') this.assetManager.liveMedia?.hold('space');
             this.assetManager.unlockAudio();
             if (this._keyMatters(e) && !this.keysDown['Meta']) {
                 e.preventDefault();
@@ -178,6 +193,17 @@ class InputHandler {
         };
 
         h.keyup = (e) => {
+            if (e.key === ' ') this.assetManager.liveMedia?.release('space');
+            if (this._isControlEvent(e)) {
+                // Focus may have moved into the frame while a game key was held.
+                if (this.keysDown[e.key]) {
+                    clearTimeout(this._keyUpTimers?.[e.key]);
+                    if (this._keyUpTimers) delete this._keyUpTimers[e.key];
+                    delete this.keysDown[e.key]; delete this._lastKeyRepeat[e.key];
+                    this.send(JSON.stringify({ type: 'keyup', key: e.key }));
+                }
+                return;
+            }
             if (this._keyMatters(e)) {
                 e.preventDefault();
                 // Debounce keyup: on macOS, holding a key triggers a synthetic
@@ -231,6 +257,7 @@ class InputHandler {
 
     detach() {
         if (!this._attached) return;
+        this.assetManager.liveMedia?.release();
         this._attached = false;
         this.gamepads?.release();
         this._releaseKeys();
@@ -297,21 +324,18 @@ class InputHandler {
         // Hover tracking. onhover/offhover fire for clickable nodes (as
         // before) and for nodes that declared an onHover handler — the
         // squished state marks those, mirroring how handleClick presence
-        // drives clicks. The pointer cursor stays clickable-only: hoverable
-        // alone doesn't imply "you can click this".
+        // drives clicks. Cursor selection is owned by the session.
         if (clickInfo.isClickable || clickInfo.action || clickInfo.isHoverable) {
             if (!this.currentHover || Number(clickInfo.nodeId) !== Number(this.currentHover)) {
                 if (this.currentHover) this._offHover(this.currentHover);
                 this.currentHover = clickInfo.nodeId;
                 this._onHover(clickInfo.nodeId);
             }
-            this.canvas.style.cursor = (clickInfo.isClickable || clickInfo.action) ? 'pointer' : 'initial';
         } else {
             if (this.currentHover) {
                 this._offHover(this.currentHover);
                 this.currentHover = null;
             }
-            this.canvas.style.cursor = 'initial';
         }
 
         this.mousePos = null;
@@ -329,10 +353,15 @@ class InputHandler {
         this._lastKeyRepeat = {};
     }
 
+    _isControlEvent(event) {
+        return !!event.target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]');
+    }
+
     _keyMatters(event) {
         return (event.key.length === 1 && event.key >= ' ' && event.key <= 'z') ||
             (event.keyCode >= 36 && event.keyCode <= 40) ||
-            event.key === 'Meta' || event.key === 'Backspace' || event.key === 'Enter';
+            event.key === 'Meta' || event.key === 'Backspace' || event.key === 'Enter' ||
+            event.key === 'Escape' || event.key === 'Shift';
     }
 
     _sendMouseUp(clientX, clientY) {
@@ -435,9 +464,9 @@ class InputHandler {
     _promptFileUpload(nodeId) {
         const inputEl = document.createElement('input');
         inputEl.type = 'file';
-        // The platform understands image and audio assets; the squished node
+        // The platform understands image, audio and video assets; the squished node
         // carries no per-node accept info, so this is the global filter.
-        inputEl.accept = 'image/*,audio/*';
+        inputEl.accept = 'image/*,audio/*,video/*';
         inputEl.style.display = 'none';
         document.body.appendChild(inputEl);
         const cleanupInput = () => {

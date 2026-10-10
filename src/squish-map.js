@@ -10,5 +10,6 @@ const squishMap = {
 };
 
 const DEFAULT_VERSION = '142';
+for (const squish of Object.values(squishMap)) require('homegames-common/stream-node').installStreamNode(squish.GameNode);
 
 module.exports = { squishMap, DEFAULT_VERSION };

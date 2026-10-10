@@ -23,8 +23,10 @@ const { GameView, FrameLoop, getClientInfo } = require('./game-view');
 
 const { squishMap, DEFAULT_VERSION } = require('./squish-map');
 const LocalSession = require('./local-session');
+const MediaClient = require('./media-client');
 const { RtcHost, createRtcTransport, readInvitation } = require('./rtc-session');
 const { createSaveStore } = require('./save-store');
+const { CURSOR_OPCODE, decodeCursor } = require('homegames-common/cursor');
 
 class HomegamesClient {
     /**
@@ -49,6 +51,8 @@ class HomegamesClient {
      * @param {function} [opts.loadLocalGame] — async (request, { signal }) =>
      *        { files, entryPoint, assetBundle, gameKey, versionId, name }.
      *        Override the default home-server manifest loader for another host.
+     * @param {boolean|string} [opts.localHome] — false hides Home; a URL returns
+     *        to that page. Otherwise Home reconnects to the WebSocket dashboard.
      */
     constructor(opts) {
         this.containerId = opts.containerId;
@@ -93,7 +97,7 @@ class HomegamesClient {
             mountLocal: game => {
                 this._shareOptions = typeof opts.share === 'function' ? opts.share(game) : opts.share;
                 return createLocalChrome(this.containerId, game.name || game.gameKey,
-                opts.localHome === false ? null : () => this.exitLocalGame(), this._shareOptions ? {
+                opts.localHome === false ? null : typeof opts.localHome === 'string' ? opts.localHome : () => this.exitLocalGame(), this._shareOptions ? {
                     getLink: () => this._getRtcHost().share(),
                     private: this._shareOptions.visibility !== 'public',
                     onVisibility: this._shareOptions.room ? visibility => this._getRtcHost().setVisibility(visibility) : null,
@@ -132,6 +136,16 @@ class HomegamesClient {
         return this._rtcHost;
     }
 
+    getNetworkStats() {
+        return (this._localSession && this._rtcHost?.getStats()) || this.transport?.getStats?.() || Promise.resolve(null);
+    }
+
+    getShareLink() {
+        if (this._localSession && this._shareOptions) return this._getRtcHost().share();
+        if (this.transport?.getShareLink) return this.transport.getShareLink();
+        throw new Error('This session is not available to share');
+    }
+
     get canvas() { return this.view?.canvas || null; }
     get container() { return this.view?.container || null; }
     get renderer() { return this.view?.renderer || null; }
@@ -149,7 +163,7 @@ class HomegamesClient {
         this.view = new GameView({
             container, send: msg => this._send(msg),
             gamepad: this.gamepadOptions,
-            onAssetReady: () => { this._frameDirty = true; },
+            onAssetReady: () => { this._frameDirty = true; this.view?.refreshCursor(); },
         });
 
         // --- Handle resize ---
@@ -162,13 +176,20 @@ class HomegamesClient {
 
         // --- Connect ---
         if (this.transportFactory) {
+            const media = new MediaClient({ container, assets: this.assetManager,
+                send: message => this.transport?.send(JSON.stringify(message)),
+                publish: (id, stream) => this.transport?.addMedia?.(id, stream),
+                unpublish: id => this.transport?.removeMedia?.(id),
+            });
             const generation = this._transportGeneration = (this._transportGeneration || 0) + 1;
             const active = () => generation === this._transportGeneration;
             this.transport = this.transportFactory({
-                onOpen: () => { if (active()) this._send(JSON.stringify({ type: 'ready', clientInfo: { clientInfo: getClientInfo() } })); },
+                onOpen: () => { if (active()) this._send(JSON.stringify({ type: 'ready', media: 1, clientInfo: { clientInfo: getClientInfo() } })); },
                 onMessage: data => { if (active() && data instanceof ArrayBuffer) this._handleBinaryMessage(new Uint8ClampedArray(data)); },
+                onMedia: message => { if (active()) media.receive(message); },
+                onTrack: stream => { if (active()) media.attach(stream); },
                 onError: err => { if (active()) this.onError(err); },
-                onClose: () => { if (active()) { this._loop.stop(); this.inputHandler?.detach(); this.onClose(); } },
+                onClose: () => { if (active()) { this._loop.stop(); this.view?.setCursor(null); this.inputHandler?.detach(); this.renderer?.stopAllSounds(); media.destroy(); this.onClose(); } },
             });
         } else if (this.workerUrl) {
             this._connectWorker();
@@ -260,6 +281,7 @@ class HomegamesClient {
         this.ws.onclose = () => {
             if (this.ws !== ws) return;
             this._loop.stop();
+            this.view?.setCursor(null);
             this.onClose();
         };
 
@@ -300,6 +322,7 @@ class HomegamesClient {
                 });
             } else if (data && data.type === 'close') {
                 this._loop.stop();
+                this.view?.setCursor(null);
                 this.onClose();
             } else if (data && data.type === 'error') {
                 this.onError(new Error(data.message));
@@ -323,6 +346,7 @@ class HomegamesClient {
         this.wsUrl = newWsUrl;
         this._loop.stop();
         this.currentBuf = null;
+        this.view?.setCursor(null);
 
         // Clear stale state from previous session
         if (this.renderer) {
@@ -361,6 +385,10 @@ class HomegamesClient {
 
             case 1: // Asset bundle
                 this.assetManager.storeAssets(buf);
+                // Some non-image assets (e.g. audio before sound unlock) have
+                // no ready callback yet. Replacing a selected image with one
+                // must still restore the native cursor immediately.
+                this.view?.refreshCursor();
                 break;
 
             case 3: // Game state frame
@@ -399,6 +427,13 @@ class HomegamesClient {
             case 12: // Single player — swap this client to an in-place LocalSession
                 this._handleLocalPlayRedirect(buf);
                 break;
+
+            case CURSOR_OPCODE: { // Session-selected cursor for this player
+                try {
+                    this.view?.setCursor(decodeCursor(buf));
+                } catch (_) { /* Ignore malformed optional control messages. */ }
+                break;
+            }
         }
     }
 
@@ -547,7 +582,7 @@ class HomegamesClient {
 
         // Render current frame — only when something changed since the last paint.
         // The input tick above still runs every frame (hover, gamepad polling).
-        if (this._frameDirty && this.currentBuf && this.currentBuf.length > 1 && this.currentBuf[0] === 3 && this.unsquish) {
+        if ((this._frameDirty || this.renderer.needsRepaint()) && this.currentBuf && this.currentBuf.length > 1 && this.currentBuf[0] === 3 && this.unsquish) {
             this.renderer.renderFrame(this.currentBuf, this.unsquish);
             this._frameDirty = false;
         }
@@ -584,6 +619,7 @@ HomegamesClient.createRtcTransport = createRtcTransport;
 HomegamesClient.readInvitation = readInvitation;
 HomegamesClient.RtcHost = RtcHost;
 HomegamesClient.createShareDialog = require('./share-dialog');
+HomegamesClient.createSessionFrame = createLocalChrome;
 HomegamesClient.householdRoom = require('./household-room');
 
 // Export for both CommonJS and browser global

@@ -1,6 +1,10 @@
 const createLocalRuntime = require('./local-game-runtime');
 const { playerFrame } = require('homegames-common/session-runtime');
 const { packAssetBundle } = require('./asset-bundle');
+const { createFileUploadHandler } = require('homegames-common/media-upload');
+const { normalizeCursor, encodeCursor } = require('homegames-common/cursor');
+const MediaSession = require('homegames-common/media-session');
+const MediaClient = require('./media-client');
 const { GameView, FrameLoop, getClientInfo } = require('./game-view');
 /**
  * LocalSession — runs a Homegames game entirely in the browser, no server.
@@ -208,13 +212,24 @@ class LocalSession {
     // Second half of start(): runs once the stored save (if any) has loaded,
     // because the game constructor takes saveData directly.
     _boot({ container, squishModule, saveGame, saveData }) {
+        const bootGeneration = this._bootGeneration;
+        this.media = new MediaSession();
+        const handleFileUpload = createFileUploadHandler({
+            Asset: squishModule.Asset,
+            registerAsset: (key, asset) => this._addLocalAsset(key, asset),
+            isPlayerActive: id => !!this.game && !this.frozen && this.players.some(player => player.playerId === id),
+        });
         // --- Instantiate game + squisher ---
         try {
             // Same option bag child_game_server passes; platform services are
             // stubbed in local mode. addAsset and saveGame/saveData are real:
             // uploads render locally and saves persist in browser storage.
             this.game = new this.gameClass({
+                media: this.media,
                 addAsset: (key, asset) => this._addLocalAsset(key, asset),
+                handleFileUpload,
+                setCursor: (playerId, cursor) => bootGeneration === this._bootGeneration
+                    && this.setCursor(playerId, cursor),
                 saveGame,
                 saveData,
                 services: {},
@@ -309,7 +324,7 @@ class LocalSession {
         this.canvas.addEventListener('mousemove', this._pick.move);
         this.canvas.addEventListener('click', this._pick.click);
         this.canvas.addEventListener('mouseleave', this._pick.leave);
-        this.canvas.style.cursor = 'crosshair';
+        this.view.setCursorOverride('crosshair');
         this._updateInputAttachment();
     }
 
@@ -318,7 +333,7 @@ class LocalSession {
         this.canvas.removeEventListener('mousemove', this._pick.move);
         this.canvas.removeEventListener('click', this._pick.click);
         this.canvas.removeEventListener('mouseleave', this._pick.leave);
-        this.canvas.style.cursor = '';
+        this.view.setCursorOverride(null);
         this._pick = null;
         this._updateInputAttachment();
     }
@@ -356,7 +371,7 @@ class LocalSession {
 
     _paintInspectedFrame() {
         if (!this._inspectBuf || !this.renderer) return;
-        this.renderer.renderFrame(this._inspectBuf, this.unsquish, { muteAudio: true });
+        this.renderer.renderFrame(this._inspectBuf, this.unsquish, { muteAudio: true, freezeMedia: true });
         this._drawHighlight();
     }
 
@@ -437,7 +452,15 @@ class LocalSession {
             },
             onAssetReady: () => this._invalidateFrames(),
         });
-        this.players.push({ playerId, view, dispatcher, currentBuf: null, frameDirty: true });
+        this.players.push({ playerId, view, dispatcher, cursor: null, currentBuf: null, frameDirty: true });
+        if (playerId === this.playerId) {
+            const device = new MediaClient({ container, assets: view.assetManager,
+                send: message => this.media.handle(playerId, message),
+                publish: (id, stream) => this.media.attach(playerId, stream),
+            });
+            this.media.join(playerId, { send: message => device.receive(message),
+                addMedia: (id, stream) => device.attach(stream), removeMedia: id => device.remove(id) });
+        }
         view.inputHandler.squishVersion = this.squishVersion;
         view.resize(this.aspectRatio);
         try {
@@ -449,9 +472,17 @@ class LocalSession {
     }
 
     _leavePlayer(player) {
+        this.media?.leave(player.playerId);
         const dispatcher = player.dispatcher;
         if (!dispatcher) return; // already left, including freeze() followed by stop()
         player.dispatcher = null;
+        player.view?.setCursor(null);
+        if (player.cursor) {
+            // A departing remote transport may already be closed. Its reset
+            // must not prevent the rest of the seat from being released.
+            try { player.send?.(encodeCursor(null)); } catch (e) {}
+        }
+        delete player.cursor;
         player.view?.inputHandler.detach();
         dispatcher.release();
         try { this.game?.handlePlayerDisconnect?.(player.playerId); } catch (e) {}
@@ -477,9 +508,10 @@ class LocalSession {
         const version = Array.from(this.squishVersion, c => c.charCodeAt(0));
         send(Uint8Array.from([2, playerId, this.aspectRatio.x, this.aspectRatio.y, 0, 0, version.length, ...version]));
         if (this.assetBundle) send(this.assetBundle);
-        if (this.dynamicAssets.size) send(packAssetBundle([...this.dynamicAssets.values()]));
+        // Each upload fits one RTC packet; all past uploads together may not.
+        for (const asset of this.dynamicAssets.values()) send(packAssetBundle([asset]));
         const dispatcher = new LocalDispatcher(this.game, playerId);
-        const player = { playerId, dispatcher, send, close, view: null, currentBuf: null, frameDirty: true };
+        const player = { playerId, dispatcher, send, close, view: null, cursor: null, currentBuf: null, frameDirty: true };
         this.players.push(player);
         try {
             this.game.handleNewPlayer?.({ playerId, settings: { SOUND: true },
@@ -491,6 +523,19 @@ class LocalSession {
             handleMessage: message => { if (player.dispatcher) player.dispatcher.handleMessage(message); },
             leave: () => this.removePlayer(playerId),
         };
+    }
+
+    // Cursor selection belongs to the seat, independently of the scene or
+    // pointer location. The game explicitly chooses when to set or clear it.
+    setCursor(playerId, cursor) {
+        if (!this.game || !this.runtime || this.frozen) return false;
+        const player = this.players.find(p => p.playerId === Number(playerId) && p.dispatcher);
+        if (!player) return false;
+        const normalized = normalizeCursor(cursor);
+        player.cursor = normalized;
+        if (player.view) player.view.setCursor(normalized);
+        else player.send(encodeCursor(normalized));
+        return true;
     }
 
     // JSON-safe copy of a GameNode subtree — enough to render a tree view and
@@ -543,6 +588,7 @@ class LocalSession {
         const onStop = this.onStop;
         this.onStop = null;
         onStop?.();
+        this.media?.destroy();
         this.runtime?.stop();
         this.runtime = null;
         this.players.forEach(player => this._leavePlayer(player));
@@ -594,9 +640,8 @@ class LocalSession {
         return Promise.resolve();
     }
 
-    // Mirrors GameSession._sendPlayerFrame: flush pending changes, take the
-    // player-scoped frame, fall back to the broadcast state when the player
-    // has no scoped nodes anywhere in the tree.
+    // Mirrors GameSession._sendPlayerFrame: flush pending changes and filter
+    // the snapshot for this viewer, including players with no private nodes.
     _captureFrame() {
         const squisher = this.squisher;
         if (!squisher) return;
@@ -608,15 +653,20 @@ class LocalSession {
             if (!frame?.length) continue;
             // Squish emits fractional values for integer bytes. Match the
             // hosted Buffer truncation; Uint8ClampedArray alone would round.
-            player.currentBuf = frame;
-            player.frameDirty = true;
-            player.send?.(frame);
+            // A remote frame is newly allocated for this seat and has no local
+            // renderer. Hand ownership to communication instead of retaining a
+            // buffer that would be detached when posted to the worker.
+            if (player.view) { player.currentBuf = frame; player.frameDirty = true; }
+            player.send?.(frame, { transfer: true });
         }
         this._emitSnapshot();
     }
 
     _invalidateFrames() {
-        this.players.forEach(player => { player.frameDirty = true; });
+        this.players.forEach(player => {
+            player.frameDirty = true;
+            player.view?.refreshCursor();
+        });
     }
 
     _initCanvas() {
@@ -632,10 +682,10 @@ class LocalSession {
             if (player.dispatcher) view.inputHandler.tick();
             if (view.destroyed) continue; // input can stop the session or remove this seat
             const { currentBuf } = player; // input can synchronously update the frame
-            if (!player.frameDirty || !currentBuf || currentBuf.length <= 1 || currentBuf[0] !== 3) continue;
+            if ((!player.frameDirty && !view.renderer.needsRepaint()) || !currentBuf || currentBuf.length <= 1 || currentBuf[0] !== 3) continue;
             const primary = player === this._primary;
             if (!primary || !this._inspectBuf) {
-                view.renderer.renderFrame(currentBuf, this.unsquish, { muteAudio: !primary || this.frozen });
+                view.renderer.renderFrame(currentBuf, this.unsquish, { muteAudio: !primary || this.frozen, freezeMedia: this.frozen });
                 if (primary) this._drawHighlight();
             }
             player.frameDirty = false;

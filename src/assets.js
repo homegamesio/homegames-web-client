@@ -2,6 +2,7 @@
  * Asset storage and decoding — handles image, audio, and font assets
  * received as binary frames from the game server.
  */
+const { describeMedia } = require('homegames-common/media-upload');
 
 // Bytes -> binary string in chunks (String.fromCharCode.apply is limited by
 // max argument count; MB-sized images would blow the call stack).
@@ -19,6 +20,10 @@ const sniffImageMime = (bytes) => {
     if (bytes.length > 3 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'image/png';
     if (bytes.length > 2 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
     if (bytes.length > 11 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+    // SVG has no binary signature. Recognize its root (optionally after an
+    // XML declaration) so generated game images decode with their real MIME.
+    const prefix = bytesToBinaryString(bytes.subarray(0, 1024)).replace(/^\xEF\xBB\xBF/, '');
+    if (/^\s*(?:<\?xml\b[^?]*\?>\s*)?<svg\b/i.test(prefix)) return 'image/svg+xml';
     return 'image/jpeg';
 };
 
@@ -27,6 +32,8 @@ class AssetManager {
         this.assets = {};       // key -> { type, data, decoded }
         this.imageCache = {};   // key -> Image element or 'loading'
         this.audioCtx = null;
+        this.mediaPlayers = new Set();
+        this.mediaUnlocked = false;
         // Optional callback invoked when an asset finishes loading
         // asynchronously (image decode, font load, audio decode). The client
         // uses this to repaint the current frame — otherwise a frame that
@@ -44,6 +51,8 @@ class AssetManager {
      * Must be called from a user gesture handler (click/touch) on iOS/Safari.
      */
     unlockAudio() {
+        this.mediaUnlocked = true;
+        for (const player of this.mediaPlayers) player.unlock();
         if (!this.audioCtx) {
             this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         }
@@ -52,12 +61,24 @@ class AssetManager {
         }
         // Decode any audio assets that were received before AudioContext was created
         for (const key in this.assets) {
-            if (this.assets[key].type === 'audio' && !this.assets[key].decoded) {
-                this.audioCtx.decodeAudioData(this.assets[key].data, (buffer) => {
-                    this.assets[key].data = buffer;
-                    this.assets[key].decoded = true;
-                    this._notifyReady();
-                });
+            const asset = this.assets[key];
+            if (asset.type === 'audio' && !asset.decoded && !asset.decoding) {
+                asset.decoding = true;
+                const failed = err => {
+                    asset.decoding = false;
+                    console.warn('Unable to decode audio:', err);
+                };
+                try {
+                    // Decoding detaches its input. Keep the retained bytes intact
+                    // for retries and the session's later RTC asset transfers.
+                    this.audioCtx.decodeAudioData(asset.data.slice(0), buffer => {
+                        if (this.assets[key] !== asset) return;
+                        asset.data = buffer;
+                        asset.decoded = true;
+                        asset.decoding = false;
+                        this._notifyReady();
+                    }, failed);
+                } catch (err) { failed(err); }
             }
         }
     }
@@ -82,7 +103,7 @@ class AssetManager {
             const payloadKey = String.fromCharCode.apply(null, payloadKeyRaw.filter(k => k));
             const payloadData = buf.slice(i + 12 + 32, i + 12 + payloadLength);
 
-            const typeName = assetType === 1 ? 'image' : assetType === 2 ? 'audio' : assetType === 3 ? 'font' : null;
+            const typeName = assetType === 1 ? 'image' : assetType === 2 ? 'audio' : assetType === 3 ? 'font' : assetType === 4 ? 'video' : null;
             if (typeName) {
                 this.storeRawAsset(payloadKey, typeName, payloadData);
             }
@@ -99,9 +120,11 @@ class AssetManager {
         const bytes = data instanceof Uint8Array || data instanceof Uint8ClampedArray
             ? data
             : Uint8Array.from(data);
+        const previous = this.assets[key];
+        if (previous?.url) URL.revokeObjectURL(previous.url);
 
         if (type === 'image') {
-            const mime = sniffImageMime(bytes);
+            const mime = describeMedia(bytes).contentType || sniffImageMime(bytes);
             this.assets[key] = { type: 'image', data: `data:${mime};base64,` + btoa(bytesToBinaryString(bytes)) };
             // If the key is reused (e.g. re-upload), drop the stale decode.
             delete this.imageCache[key];
@@ -120,9 +143,13 @@ class AssetManager {
                     console.warn('Unable to decode audio:', err);
                 }
             } else {
-                this.assets[key] = { type: 'audio', data: bytes.buffer, decoded: false };
+                this.assets[key] = { type: 'audio', data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), decoded: false };
             }
 
+        } else if (type === 'video') {
+            const media = describeMedia(bytes);
+            this.assets[key] = { type: 'video', data: new Blob([bytes], { type: media.contentType || 'video/mp4' }), url: null };
+            this._notifyReady();
         } else if (type === 'font') {
             try {
                 const font = new FontFace(key, bytes);
@@ -149,19 +176,24 @@ class AssetManager {
         }
 
         if (!this.imageCache[assetKey] && this.assets[assetKey] && this.assets[assetKey].type === 'image') {
+            const asset = this.assets[assetKey];
             const image = new Image();
             this.imageCache[assetKey] = 'loading';
             image.onload = () => {
+                if (this.assets[assetKey] !== asset) return;
                 this.imageCache[assetKey] = image;
                 this._notifyReady();
             };
-            image.src = this.assets[assetKey].data;
+            image.src = asset.data;
         }
 
         return null;
     }
 
     destroy() {
+        this.liveMedia?.destroy();
+        for (const player of [...this.mediaPlayers]) player.destroy();
+        for (const asset of Object.values(this.assets)) if (asset.url) URL.revokeObjectURL(asset.url);
         if (this.audioCtx) {
             this.audioCtx.close().catch(() => {});
             this.audioCtx = null;
