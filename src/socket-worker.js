@@ -77,6 +77,7 @@ onmessage = (msg) => {
         if (socket && socket.readyState === WebSocket.OPEN) {
             const readyMsg = {
                 type: 'ready',
+                playerName: data.playerName,
                 id: data.id || null,
                 spectating: data.spectating || false,
                 clientInfo: data.clientInfo || {},

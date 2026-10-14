@@ -75,6 +75,8 @@ class HomegamesClient {
         this.saveStore = opts.saveStore || createSaveStore();
 
         this.platform = opts.platform;
+        this._playerProfile = require('homegames-common/player-identity').profile(window);
+        this.playerName = opts.playerName === undefined ? this._playerProfile.get() : this._playerProfile.set(opts.playerName);
         this.showChrome = opts.chrome !== false;
         this.onSessionStatus = opts.onSessionStatus || (() => {});
         this.localHome = opts.localHome;
@@ -115,6 +117,7 @@ class HomegamesClient {
                 return chrome;
             },
             createLocal: game => new LocalSession({ ...game,
+                playerName: this.playerName,
                 gamepad: this.gamepadOptions, platform: opts.platform, saveStore: this.saveStore,
                 onSaveData: this.onSaveData, onError: this.onError, onReady: id => {
                     this.onReady(id);
@@ -204,6 +207,16 @@ class HomegamesClient {
         if (enabled) input?.attach(); else input?.detach();
     }
 
+    getPlayerName() { return this.playerName; }
+    setPlayerName(value) {
+        const name = this._playerProfile.set(value);
+        this.playerName = name;
+        if (this._localSession) this._localSession.setPlayerName(this._localSession.playerId, name);
+        else if (!this.spectating) this._send(JSON.stringify({ type: 'player-info', name }));
+        this.platform?.setState?.({ playerName: name });
+        return name;
+    }
+
     showShare() {
         if (!this._shareDialog) this._shareDialog = require('./share-dialog')({ container: document.body,
             getLink: () => this.getShareLink(), onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true) });
@@ -212,6 +225,7 @@ class HomegamesClient {
 
     _configureToolbar(toolbar) {
         if (!toolbar) return;
+        toolbar.setPlayerName(this.playerName, name => this.setPlayerName(name));
         toolbar.setAction('manual-connect', { label: 'Manual connection', run: () => {
             if (!this._manualPairing) this._manualPairing = HomegamesClient.createManualPairing({ container: document.body,
                 getSession: () => this._localSession, onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true),
@@ -268,7 +282,7 @@ class HomegamesClient {
             const generation = this._transportGeneration = (this._transportGeneration || 0) + 1;
             const active = () => generation === this._transportGeneration;
             this.transport = this.transportFactory({
-                onOpen: () => { if (active()) this._send(JSON.stringify({ type: 'ready', media: 1, recording: 2, clientInfo: { clientInfo: getClientInfo() } })); },
+                onOpen: () => { if (active()) this._send(JSON.stringify({ type: 'ready', playerName: this.playerName, media: 1, recording: 2, clientInfo: { clientInfo: getClientInfo() } })); },
                 onMessage: data => { if (active() && data instanceof ArrayBuffer) this._handleBinaryMessage(new Uint8ClampedArray(data)); },
                 onMedia: message => { if (active()) media.receive(message); },
                 onTrack: stream => { if (active()) media.attach(stream); },
@@ -355,6 +369,7 @@ class HomegamesClient {
             if (this.ws !== ws) return;
             const readyMsg = {
                 type: 'ready',
+                playerName: this.playerName,
                 spectating: this.spectating,
                 clientInfo: { clientInfo: getClientInfo() },
             };
@@ -409,6 +424,7 @@ class HomegamesClient {
                 // Worker opened the socket — send ready
                 this.worker.postMessage({
                     type: 'sendReady',
+                    playerName: this.playerName,
                     id: this.playerId,
                     spectating: this.spectating,
                     clientInfo: { clientInfo: getClientInfo() },

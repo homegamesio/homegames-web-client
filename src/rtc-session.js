@@ -190,7 +190,7 @@ class RtcHost {
                         const ready = JSON.parse(data);
                         if (ready.type !== 'ready') throw new Error('Expected player handshake');
                         seat = this.session.addRemotePlayer({ send: (bytes, options) => peer.channel.send(bytes, options),
-                            close: () => peer.close(), clientInfo: ready.clientInfo?.clientInfo || {} });
+                            close: () => peer.close(), playerName: ready.playerName, clientInfo: ready.clientInfo?.clientInfo || {} });
                         if (ready.media === 1) this.session.media?.join(seat.playerId, {
                             recording: ready.recording === 1 || ready.recording === 2,
                             audioRecording: ready.recording === 2,

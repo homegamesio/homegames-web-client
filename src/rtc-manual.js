@@ -60,7 +60,7 @@ class ManualHost {
                     if(typeof data!=='string'||data.length>65536)throw new Error('Invalid player input');
                     if(Date.now()-windowAt>1000){windowAt=Date.now();count=0;}if(++count>240)throw new Error('Too much player input');
                     if(!seat){const ready=JSON.parse(data);if(ready.type!=='ready')throw new Error('Expected player handshake');
-                        seat=this.session.addRemotePlayer({send:(bytes,settings)=>peer.channel.send(bytes,settings),close:()=>peer.close(),clientInfo:ready.clientInfo?.clientInfo||{}});
+                        seat=this.session.addRemotePlayer({send:(bytes,settings)=>peer.channel.send(bytes,settings),close:()=>peer.close(),playerName:ready.playerName,clientInfo:ready.clientInfo?.clientInfo||{}});
                         this.onStatus('Manual player connected');
                     }else seat.handleMessage(data);
                 }catch(error){peer.close(error);}

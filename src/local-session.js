@@ -46,17 +46,7 @@ const {
     DEFAULT_VERSION_ID,
 } = require('./save-store');
 
-// Same anonymous-name style the server uses (game-session.js)
-const NAME_WORDS = [
-    'chocolate', 'iguana', 'cardigan', 'enormous', 'gargantuan', 'orangutan',
-    'cookies', 'monstera', 'daisy', 'grapefruit', 'blueberry', 'mango',
-    'elephant', 'bamboo', 'sapphire', 'papaya', 'waffle', 'turquoise',
-    'aquatic', 'goblin', 'funky', 'hotdog', 'elegant', 'cascade', 'euphoria',
-];
-const generateName = () => {
-    const pick = () => NAME_WORDS[Math.floor(Math.random() * NAME_WORDS.length)];
-    return pick() + ' ' + pick();
-};
+const { generateName, initialName, normalizeName } = require('homegames-common/player-identity');
 
 class LocalSession {
     /**
@@ -91,7 +81,7 @@ class LocalSession {
         this.files = opts.files || null;
         this.entryPoint = opts.entryPoint || 'index.js';
         this.playerId = opts.playerId || 1;
-        this.playerName = opts.playerName || generateName();
+        this.playerName = initialName(opts.playerName);
         this.assetBundle = opts.assetBundle || null;
         this.assetPackets = this.assetBundle ? splitAssetBundle(this.assetBundle) : [];
         this.onReady = opts.onReady || (() => {});
@@ -482,7 +472,7 @@ class LocalSession {
             },
             onAssetReady: () => this._invalidateFrames(),
         });
-        this.players.push({ playerId, view, dispatcher, cursor: null, currentBuf: null, frameDirty: true });
+        this.players.push({ playerId, info: { name: playerName }, settings: { SOUND: true }, view, dispatcher, cursor: null, currentBuf: null, frameDirty: true });
         if (playerId === this.playerId) {
             const device = new MediaClient({ container, platform: this.platform, assets: view.assetManager,
                 send: message => this.media.handle(playerId, message),
@@ -533,7 +523,7 @@ class LocalSession {
 
     // A remote seat uses the same game, dispatcher and frame capture as a
     // local view. Its transport owns rendering on the other device.
-    addRemotePlayer({ send, close, clientInfo = {} }) {
+    addRemotePlayer({ send, close, clientInfo = {}, playerName }) {
         if (!this.game || this.frozen) throw new Error('The host game has ended');
         if (this.players.length >= this.maxPlayers) throw new Error('This game is full');
         let playerId = 1;
@@ -547,11 +537,11 @@ class LocalSession {
         // Each upload fits one RTC packet; all past uploads together may not.
         for (const asset of this.dynamicAssets.values()) send(packAssetBundle([asset]));
         const dispatcher = new LocalDispatcher(this.game, playerId);
-        const player = { playerId, dispatcher, send, close, view: null, cursor: null, currentBuf: null, frameDirty: true };
+        const player = { playerId, info: { name: initialName(playerName) }, settings: { SOUND: true }, dispatcher, send, close, view: null, cursor: null, currentBuf: null, frameDirty: true };
         this.players.push(player);
         try {
             this.game.handleNewPlayer?.({ playerId, settings: { SOUND: true },
-                info: { name: generateName() }, clientInfo, requestedGame: null });
+                info: { ...player.info }, clientInfo, requestedGame: null });
             this._captureFrame();
         } catch (err) { this.removePlayer(playerId); throw err; }
         return {
@@ -559,11 +549,29 @@ class LocalSession {
             handleMessage: message => {
                 if (!player.dispatcher) return;
                 let value; try { value = JSON.parse(message); } catch (_) { return; }
-                if (value.type === 'project-transfer') this.handleProjectMessage(playerId, value, send);
+                if (value?.type === 'player-info') {
+                    // The transport owns the seat; never trust a supplied playerId.
+                    try { this.setPlayerName(playerId, value.name); } catch (_) {}
+                }
+                else if (value?.type === 'project-transfer') this.handleProjectMessage(playerId, value, send);
                 else player.dispatcher.handleInput(value);
             },
             leave: () => this.removePlayer(playerId),
         };
+    }
+
+    setPlayerName(playerId, value) {
+        const name = normalizeName(value);
+        // A menu can be used while saved progress is still loading.
+        if (playerId === this.playerId) this.playerName = name;
+        const player = this.players.find(p => p.playerId === playerId && p.dispatcher);
+        if (!player || !this.game || this.frozen) return false;
+        if (player.info.name === name) return name;
+        player.info = { ...player.info, name };
+        try { this.game.handlePlayerUpdate?.(playerId, { info: { ...player.info }, settings: { ...player.settings } }); }
+        catch (error) { console.error('[LocalSession] game.handlePlayerUpdate threw:', error); }
+        this._captureFrame();
+        return name;
     }
 
     exportProject(playerId) {

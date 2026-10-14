@@ -24,7 +24,8 @@ module.exports = {
         const clientHost = portableClient.attachClientHost(window, frame, portableClient.recordAudio, storage,
             require('homegames-common/exports-viewer').createExportsViewer,
             require('homegames-common/video-recording').recordVideo,
-            require('homegames-common/player-toolbar').createPlayerToolbar, settings);
+            require('homegames-common/player-toolbar').createPlayerToolbar,
+            { ...settings, profile: require('homegames-common/player-identity').profile(window) });
         return { ...savesHost, get stopped() { return savesHost.stopped; },
             command: clientHost.command, downloadGame: clientHost.download,
             close: async () => { clientHost.close(); await savesHost.close(); } };

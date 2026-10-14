@@ -23,6 +23,10 @@ client.start();
 
 ## Architecture (`src/`)
 
+Player names start with a random two-word name and are remembered per browser origin. Players edit them through **More → Your name → Save name** in the shared player toolbar. Embedders can supply `playerName`, read `client.getPlayerName()`, or call `client.setPlayerName(name)` (1–32 characters). Storage failures fall back to an in-memory preference. Opaque game frames receive the preference from their trusted wrapper; game downloads do not embed the sender’s name.
+
+Games receive `info.name` in `handleNewPlayer({ playerId, info, settings, clientInfo })`, and subsequent edits through `handlePlayerUpdate(playerId, { info, settings })`. The player ID and settings remain unchanged. Games that cache names should refresh their labels in that callback. Names are display text, not unique identifiers. Both signaled and manual RTC bind updates to the sending connection’s seat.
+
 | Module | Role |
 |---|---|
 | `index.js` | `HomegamesClient` — inline/worker WebSocket lifecycle and binary protocol dispatch |
@@ -36,7 +40,7 @@ client.start();
 | `input.js` | Mouse/touch/keyboard/gamepad → JSON protocol messages; point-in-polygon hit-testing, hover tracking, text prompts, file uploads (5 MB cap; oversized images are auto-shrunk to fit), gamepad via `homepad` |
 | `image-fit.js` | `fitImageToSize(blob, maxBytes)` — standalone, dependency-free canvas re-encoder that fits an image into a byte budget (quality first, then dimensions); JPEG/WebP keep their format, everything else re-encodes to WebP (or JPEG where WebP encoding is unavailable) |
 | `assets.js` | Parses binary asset bundles; decodes images, audio (WebAudio), fonts; owns video Blobs/URLs and media sound unlock |
-| `squish-map.js` | Browser map: `142`, `143`, `144`; default `142`. See the dependency caveat below. |
+| `squish-map.js` | Browser map: `142`, `143`, `145`, `146`; default `142`. |
 | `socket-worker.js` | Web Worker that owns the WebSocket and forwards frames as zero-copy transferables |
 | `rtc-network.js`, `rtc-worker.js` | One communication worker per browser host or RTC guest; shared by every peer, with bounded queues across the worker boundary |
 | `rtc-session.js`, `rtc-signaling-client.js` | Room/peer lifecycle and signaling; worker owns the signaling socket and heartbeat, Window negotiates RTCPeerConnection |
@@ -139,14 +143,14 @@ Coordinates throughout are percentages (0–100) of the canvas; the canvas rende
 ## Build
 
 ```sh
-npm install     # postinstall runs homegames-common's link-squish.js to symlink squish versions
+npm ci          # install the locked registry dependencies
 npm run build   # webpack → dist/homegames-client.js (UMD, global `HomegamesClient`)
 npm run watch
 ```
 
 Notes on the build:
 
-- `homegames-common` is a `file:../homegames-common` dependency; the `postinstall` step symlinks its `squish-*` packages into this package's `node_modules` (npm doesn't hoist deps of `file:` deps), so a sibling checkout of `homegames-common` is required.
+- `homegames-common`, Homepad and the Squish aliases use published registry versions. Direct Squish imports are declared in this package; installation does not modify dependency directories with a postinstall hook.
 - Webpack injects the `buffer` polyfill as a global; `Buffer` is load-bearing in `LocalSession` frame capture (truncation vs. rounding of float coordinates).
 - homegames-web bundles this package's **source** into its own `web/bundle.js`; the prebuilt `dist/` UMD is for standalone/external embedders.
 
@@ -160,7 +164,7 @@ Notes on the build:
 ## Notes / caveats
 
 - Local frames still pass through Squish serialization and decoding. The runtime uses `getPlayerFrame` and optional `flush`; its owned clock temporarily hides `tick` during the synchronous Squisher constructor, then restores the original property. See the architecture record for why 142 needs this.
-- The browser version map currently differs from common's 142/143/145 map. This checkout's 144 alias resolves to a local 1.4.5 checkout; a successful local build does not prove a clean package install works. Align aliases/packages before release.
+- The browser and common runtime maps support 142, 143, 145 and 146. The older browser adapters retain their scene codecs and use 146's Asset/Squisher plumbing; test compatibility when changing either side.
 - Installed Squish Asset modules log caught `process is not defined` errors when loaded in a browser. This is a remaining dependency packaging issue; the session smoke tests still render and accept input.
 - `packAssetBundle` is available for browser tooling that already has asset bytes. LocalSession does not fetch undeclared or missing assets itself.
 - The GitHub remote is named `homegames-web-client`; the package and directory are `homegames-client`.
@@ -210,7 +214,11 @@ new HomegamesClient({
 
 Examples in homegames-core: `gamepad-test` demonstrates bindings, button edges and analog diagnostics; `move-test` demonstrates two analog sticks; `halloween-words` uses declarative bindings. In homegames-web, `?local=gamepad-test` runs the diagnostic without a server game session.
 
-For this multi-repo development checkout, both the client and common runtime use `file:../homepad` (0.2.0). Keep the sibling checkout present, run each consumer's `npm install`, run the client's `npm run postinstall` to restore Squish links, and rebuild client bundles. The runner Docker build also copies Homepad. Publishing these packages requires publishing Homepad first and switching the development file dependencies to its released version.
+The client uses published `homepad@0.2.0` and `homegames-common@1.7.1`. It declares all four Squish runtime aliases as direct dependencies because its source imports them directly. A normal `npm ci` installs those packages; no postinstall symlink helper or sibling checkout is required.
+
+## Packaging
+
+Run `npm ci`, then `npm pack`. The `prepack` script rebuilds the browser bundle, and the package includes `src/`, `dist/`, the webpack configuration, README and license. Test the resulting tarball in an empty consumer directory before publishing. This checks the installed package rather than local development symlinks. The website can also rebuild an installed client using its own declared webpack build dependency.
 
 ## Manual RTC pairing
 
