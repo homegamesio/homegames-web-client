@@ -41,8 +41,7 @@ const loadGameClass = ({ files, entryPoint }) => {
             if (squishMatch) {
                 const squishModule = squishMap[squishMatch[1]];
                 if (squishModule) return squishModule;
-                console.warn('Game requires unbundled squish version "' + request + '", substituting squish-' + DEFAULT_VERSION);
-                return squishMap[DEFAULT_VERSION];
+                throw new Error('Unsupported Squish runtime: ' + request);
             }
 
             if (request.startsWith('./') || request.startsWith('../')) {

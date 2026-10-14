@@ -1,9 +1,12 @@
 // Device-owned capture and stream lookup. Only an explicit platform consent
 // button calls getUserMedia; game code receives handles, never capture objects.
+const RecordingClient = require('./recording-client');
 class MediaClient {
-    constructor({ container, assets, send, publish = () => {}, unpublish = () => {} }) {
+    constructor({ container, assets, send, platform, publish = () => {}, unpublish = () => {} }) {
         Object.assign(this, { container, assets, send, publish, unpublish });
         this.streams = new Map(); this.received = new Map(); this.pending = new Map(); this.held = new Set();
+        this.recorder = new RecordingClient({ container, send, platform,
+            busy: () => this.pending.size || [...this.streams.values()].some(a => a.local) });
         assets.liveMedia = this;
         this.releaseAll = () => this.release();
         this.visibility = () => { if (document.hidden) this.release(); };
@@ -22,6 +25,8 @@ class MediaClient {
     }
     receive(message) {
         if (this.closed) return;
+        if (message.action === 'record') return this.recorder.request(message.recording);
+        if (message.action === 'record-cancel') return this.recorder.cancel(message.id);
         if (message.action === 'request') return this.request(message.stream);
         if (message.action === 'ended') return this.remove(message.id);
         if (['available', 'state'].includes(message.action)) {
@@ -48,7 +53,7 @@ class MediaClient {
     }
     request(info) {
         if (!info || this.pending.has(info.id)) return;
-        if (this.pending.size || [...this.streams.values()].some(a => a.local)) {
+        if (this.recorder.active || this.pending.size || [...this.streams.values()].some(a => a.local)) {
             this.send({ type: 'media', action: 'result', id: info.id, error: 'A microphone/camera is already active or awaiting permission' }); return;
         }
         const dialog = document.createElement('dialog');
@@ -110,6 +115,7 @@ class MediaClient {
     destroy() {
         if (this.closed) return;
         this.closed = true;
+        this.recorder.destroy();
         for (const id of [...this.pending.keys(), ...this.streams.keys()]) this.remove(id);
         this.received.clear(); this.held.clear();
         window.removeEventListener('blur', this.releaseAll); document.removeEventListener('visibilitychange', this.visibility);

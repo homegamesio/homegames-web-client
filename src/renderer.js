@@ -6,7 +6,6 @@
  */
 
 const VideoPlayer = require('./video-player');
-const { readStreamKey } = require('homegames-common/stream-node');
 
 class Renderer {
     constructor(canvas, assetManager) {
@@ -131,9 +130,9 @@ class Renderer {
             }
 
             // --- Assets (images + audio) ---
-            if (thing.asset) {
-                const assetKey = Object.keys(thing.asset)[0];
-                const stream = readStreamKey(assetKey);
+            if (thing.asset || thing.stream) {
+                const stream = thing.stream;
+                const assetKey = stream ? stream.id : Object.keys(thing.asset)[0];
                 const assetData = stream ? assetManager.liveMedia?.streams.get(stream.id) : assetManager.assets[assetKey];
 
                 if (assetData && assetData.type === 'audio') {
@@ -151,7 +150,7 @@ class Renderer {
                         }
                     }
                 } else if (assetData && (assetData.type === 'image' || assetData.type === 'video' || (stream && assetData.data))) {
-                    const asset = thing.asset[assetKey];
+                    const asset = stream || thing.asset[assetKey];
                     let image;
                     if (assetData.type === 'video' || stream) {
                         const id = `${thing.id}:${assetKey}`;

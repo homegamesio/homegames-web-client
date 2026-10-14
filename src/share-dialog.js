@@ -2,12 +2,13 @@ const qrcode = require('qrcode-generator');
 
 // The encoder runs locally: invitation capabilities never go to a QR service.
 module.exports = function createShareDialog({ container, getLink, onOpen, onClose,
+    title = 'Share this game', readyText = 'Anyone with this link can join', closeLabel = 'Done',
     hintText = 'Scan to join. Keep this game tab open.' }) {
     const dialog = document.createElement('dialog');
     const releaseStyles = require('./session-frame-styles')();
     dialog.className = 'hg-share-dialog';
-    dialog.setAttribute('aria-label', 'Share this game');
-    const heading = document.createElement('h2'); heading.textContent = 'Share this game';
+    dialog.setAttribute('aria-label', title);
+    const heading = document.createElement('h2'); heading.textContent = title;
     const hint = document.createElement('p'); hint.textContent = hintText;
     hint.className = 'hg-share-hint';
     const qr = document.createElement('div');
@@ -28,7 +29,7 @@ module.exports = function createShareDialog({ container, getLink, onOpen, onClos
         catch (_) { link.focus(); link.select(); status.textContent = 'Copy the selected invitation link'; }
     });
     copy.className = 'hg-share-copy';
-    const close = button('Done', () => dialog.close());
+    const close = button(closeLabel, () => dialog.close());
     [heading, hint, qr, status, link, actions].forEach(el => dialog.appendChild(el));
     container.appendChild(dialog);
     let generation = 0, disposed = false;
@@ -38,6 +39,7 @@ module.exports = function createShareDialog({ container, getLink, onOpen, onClos
         if (event.clientX < box.left || event.clientX > box.right || event.clientY < box.top || event.clientY > box.bottom) dialog.close();
     } });
     return {
+        setStatus(text) { if (!disposed) status.textContent = text; },
         async show() {
             if (disposed || dialog.open) return;
             const current = ++generation;
@@ -52,7 +54,7 @@ module.exports = function createShareDialog({ container, getLink, onOpen, onClos
                 qr.firstChild.style.cssText = 'display:block;width:100%;height:100%;background:white';
                 qr.hidden = false;
                 link.value = url; link.hidden = false; copy.disabled = false;
-                status.textContent = 'Anyone with this link can join';
+                status.textContent = readyText;
             } catch (err) { if (current === generation) status.textContent = err.message; }
         },
         dispose() {

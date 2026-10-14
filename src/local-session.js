@@ -1,6 +1,8 @@
+const { ProjectTransferHost } = require('homegames-common/project-transfer');
 const createLocalRuntime = require('./local-game-runtime');
 const { playerFrame } = require('homegames-common/session-runtime');
 const { packAssetBundle } = require('./asset-bundle');
+const { splitAssetBundle } = require('homegames-common/local-play-shared');
 const { createFileUploadHandler } = require('homegames-common/media-upload');
 const { normalizeCursor, encodeCursor } = require('homegames-common/cursor');
 const MediaSession = require('homegames-common/media-session');
@@ -82,6 +84,8 @@ class LocalSession {
      */
     constructor(opts) {
         this.gamepadOptions = opts.gamepad ?? {};
+        this.platform = opts.platform;
+        this.packageRevision = opts.packageRevision;
         this.containerId = opts.containerId;
         this.gameClass = opts.gameClass || null;
         this.files = opts.files || null;
@@ -89,6 +93,7 @@ class LocalSession {
         this.playerId = opts.playerId || 1;
         this.playerName = opts.playerName || generateName();
         this.assetBundle = opts.assetBundle || null;
+        this.assetPackets = this.assetBundle ? splitAssetBundle(this.assetBundle) : [];
         this.onReady = opts.onReady || (() => {});
         this.onError = opts.onError || (() => {});
         this.gameKey = opts.gameKey || null;
@@ -103,6 +108,7 @@ class LocalSession {
         this.onStop = null;
         this.unsquish = null;
         this.aspectRatio = null;
+        this.pointerLockEnabled = false;
 
         this.frozen = false;     // game ended, view kept for inspection
         this._loop = new FrameLoop(() => this._paintFrame());
@@ -161,11 +167,12 @@ class LocalSession {
         // --- Resolve squish version from game metadata ---
         const metadata = (typeof this.gameClass.metadata === 'function') ? this.gameClass.metadata() : {};
         this.maxPlayers = Math.min(255, metadata.maxPlayers || 64);
+        this.pointerLockEnabled = metadata.pointerLock === true;
         const squishVersion = metadata.squishVersion || DEFAULT_VERSION;
         let squishModule = squishMap[squishVersion];
         if (!squishModule) {
-            console.warn('Unknown squish version: ' + squishVersion + ', falling back to ' + DEFAULT_VERSION);
-            squishModule = squishMap[DEFAULT_VERSION];
+            this.onError(new Error('Unsupported Squish runtime: squish-' + squishVersion));
+            return;
         }
         this.unsquish = squishModule.unsquish;
         this.squishVersion = squishVersion;
@@ -179,7 +186,12 @@ class LocalSession {
         const compatibility = Array.isArray(metadata.saveCompatibility) ? metadata.saveCompatibility : [];
 
         const bootGeneration = this._bootGeneration;
-        this.saveStore.getSave(saveKey).catch(() => null).then((envelope) => {
+        // this.saveStore.getSave(saveKey).catch(() => null).then((envelope) => {
+        this.exportStorage = this.platform?.getExports ? this.platform : require('homegames-common/export-storage').createExportStorage(window, { installationId: gameKey, gameId: gameKey, packageRevision: this.packageRevision });
+        this.saveStore.getSave(saveKey).catch(error => {
+            if (this.saveStore.strict) throw error;
+            return null;
+        }).then(async (envelope) => {
             if (bootGeneration !== this._bootGeneration) return; // stopped/restarted mid-load
             const saveData = (envelope && isCompatibleSave(envelope, this.versionId, compatibility))
                 ? envelope.data
@@ -187,6 +199,7 @@ class LocalSession {
 
             // Debounced like the server backends: bursts coalesce, last write
             // wins, callers resolve when the batched write lands.
+            /* Previous iframe-side debounce retained for rollback.
             const writeSave = createDebouncedWriter({
                 intervalMs: 1000,
                 write: (env) => this.saveStore.putSave(saveKey, env).then(() => {
@@ -195,6 +208,15 @@ class LocalSession {
                     }
                 }),
             });
+            */
+            const persist = env => this.saveStore.putSave(saveKey, env).then(() => {
+                if (this.onSaveData) {
+                    try { this.onSaveData(env); } catch (_) {}
+                }
+            });
+            // A scoped portable store sends immediately to its parent. Other
+            // backends retain the existing one-second coalescing behavior.
+            const writeSave = this.saveStore.eager ? persist : createDebouncedWriter({intervalMs:1000,write:persist});
             const saveGame = (data) => {
                 let cleaned;
                 try {
@@ -205,8 +227,11 @@ class LocalSession {
                 return writeSave({ gameKey, versionId: this.versionId, savedAt: Date.now(), data: cleaned });
             };
 
+            const savedExports = await this.exportStorage.getExports().catch(error => { this.exportStorageError = error; return {}; });
+            if (bootGeneration !== this._bootGeneration) return;
+            this.userExportsStore = require('homegames-common/game-project').openGameExports(this.gameClass, { saved: savedExports, persist: (name, bytes) => { if (this.exportStorageError) return Promise.reject(this.exportStorageError); return this.exportStorage.putExport(name, bytes); } });
             this._boot({ container, squishModule, saveGame, saveData });
-        });
+        }).catch(error => { if (bootGeneration === this._bootGeneration) this.onError(error); });
     }
 
     // Second half of start(): runs once the stored save (if any) has loaded,
@@ -225,6 +250,8 @@ class LocalSession {
             // stubbed in local mode. addAsset and saveGame/saveData are real:
             // uploads render locally and saves persist in browser storage.
             this.game = new this.gameClass({
+                createExport: this.userExportsStore.createExport,
+                userExports: this.userExportsStore.userExports,
                 media: this.media,
                 addAsset: (key, asset) => this._addLocalAsset(key, asset),
                 handleFileUpload,
@@ -236,7 +263,10 @@ class LocalSession {
             });
             // The runtime owns ticking; Squish owns scene serialization.
             // Frameless: no custom layers, scale 1.
-            this.runtime = createLocalRuntime(squishModule.Squisher, this.game);
+            this.runtime = createLocalRuntime(squishModule, this.game, { userExportsStore: this.userExportsStore });
+            this.projectTransfers = new ProjectTransferHost({ exportProject: id => this.exportProject(id),
+                listExports: () => this.runtime.listExports(), readExport: (_, name) => this.runtime.readExport(name) });
+            for (const [key, asset] of Object.entries(this.game.getAssets?.() || {})) this._addLocalAsset(key, asset);
         } catch (err) {
             this.stop();
             this.onError(err);
@@ -454,14 +484,15 @@ class LocalSession {
         });
         this.players.push({ playerId, view, dispatcher, cursor: null, currentBuf: null, frameDirty: true });
         if (playerId === this.playerId) {
-            const device = new MediaClient({ container, assets: view.assetManager,
+            const device = new MediaClient({ container, platform: this.platform, assets: view.assetManager,
                 send: message => this.media.handle(playerId, message),
                 publish: (id, stream) => this.media.attach(playerId, stream),
             });
-            this.media.join(playerId, { send: message => device.receive(message),
+            this.media.join(playerId, { audioRecording: true, send: message => device.receive(message),
                 addMedia: (id, stream) => device.attach(stream), removeMedia: id => device.remove(id) });
         }
         view.inputHandler.squishVersion = this.squishVersion;
+        view.inputHandler.setPointerLockEnabled(this.pointerLockEnabled);
         view.resize(this.aspectRatio);
         try {
             this.game.handleNewPlayer?.({ playerId, settings: { SOUND: true },
@@ -472,6 +503,7 @@ class LocalSession {
     }
 
     _leavePlayer(player) {
+        this.projectTransfers?.leave(player.playerId);
         this.media?.leave(player.playerId);
         const dispatcher = player.dispatcher;
         if (!dispatcher) return; // already left, including freeze() followed by stop()
@@ -483,6 +515,7 @@ class LocalSession {
             try { player.send?.(encodeCursor(null)); } catch (e) {}
         }
         delete player.cursor;
+        player.view?.inputHandler.setPointerLockEnabled(false);
         player.view?.inputHandler.detach();
         dispatcher.release();
         try { this.game?.handlePlayerDisconnect?.(player.playerId); } catch (e) {}
@@ -506,8 +539,11 @@ class LocalSession {
         let playerId = 1;
         while (this.players.some(p => p.playerId === playerId)) playerId++;
         const version = Array.from(this.squishVersion, c => c.charCodeAt(0));
-        send(Uint8Array.from([2, playerId, this.aspectRatio.x, this.aspectRatio.y, 0, 0, version.length, ...version]));
-        if (this.assetBundle) send(this.assetBundle);
+        // Legacy init ended after the version. Older clients ignore this optional
+        // trailing input-flags byte; bit 0 enables user-initiated mouse capture.
+        // send(Uint8Array.from([2, playerId, this.aspectRatio.x, this.aspectRatio.y, 0, 0, version.length, ...version]));
+        send(Uint8Array.from([2, playerId, this.aspectRatio.x, this.aspectRatio.y, 0, 0, version.length, ...version, this.pointerLockEnabled ? 1 : 0]));
+        for (const packet of this.assetPackets) send(packet);
         // Each upload fits one RTC packet; all past uploads together may not.
         for (const asset of this.dynamicAssets.values()) send(packAssetBundle([asset]));
         const dispatcher = new LocalDispatcher(this.game, playerId);
@@ -520,9 +556,24 @@ class LocalSession {
         } catch (err) { this.removePlayer(playerId); throw err; }
         return {
             playerId,
-            handleMessage: message => { if (player.dispatcher) player.dispatcher.handleMessage(message); },
+            handleMessage: message => {
+                if (!player.dispatcher) return;
+                let value; try { value = JSON.parse(message); } catch (_) { return; }
+                if (value.type === 'project-transfer') this.handleProjectMessage(playerId, value, send);
+                else player.dispatcher.handleInput(value);
+            },
             leave: () => this.removePlayer(playerId),
         };
+    }
+
+    exportProject(playerId) {
+        if (!this.runtime || this.frozen || !this.players.some(p => p.playerId === Number(playerId) && p.dispatcher)) return Promise.reject(new Error('Join the game before requesting a copy'));
+        return this.runtime.exportProject(Number(playerId));
+    }
+
+    handleProjectMessage(playerId, message, send) {
+        if (!this.players.some(p => p.playerId === Number(playerId) && p.dispatcher)) return;
+        void this.projectTransfers?.handle(Number(playerId), message, send);
     }
 
     // Cursor selection belongs to the seat, independently of the scene or
@@ -589,9 +640,11 @@ class LocalSession {
         this.onStop = null;
         onStop?.();
         this.media?.destroy();
+        this.projectTransfers?.close();
         this.runtime?.stop();
         this.runtime = null;
         this.players.forEach(player => this._leavePlayer(player));
+        this.pointerLockEnabled = false;
         try { this.game?.close?.(); } catch (e) {}
         try { this.game?.destroy?.(); } catch (e) {}
         this.game = null;

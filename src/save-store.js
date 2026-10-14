@@ -46,7 +46,8 @@ const serializeSaveData = (data) => {
     if (json === undefined) {
         throw new Error('Save data must be JSON-serializable');
     }
-    if (json.length > MAX_SAVE_DATA_BYTES) {
+    // if (json.length > MAX_SAVE_DATA_BYTES) { // Count UTF-8 bytes, like the server backend.
+    if (new TextEncoder().encode(json).length > MAX_SAVE_DATA_BYTES) {
         throw new Error('Save data exceeds ' + MAX_SAVE_DATA_BYTES + ' bytes');
     }
     return json;

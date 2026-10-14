@@ -1,76 +1,39 @@
 const useFrameStyles = require('./session-frame-styles');
+const { createPlayerToolbar } = require('homegames-common/player-toolbar');
 
-// Navigation and session controls live outside the canvas, for both a local
-// host and an invited player. Home can be a URL or an in-place dashboard action.
 const createLocalChrome = (containerId, title, onHome, share = null, options = {}) => {
     const container = document.getElementById(containerId);
     if (!container) throw new Error('Container element not found: #' + containerId);
     container.innerHTML = '';
     const releaseStyles = useFrameStyles();
-    const element = (tag, className, text) => {
-        const el = document.createElement(tag);
-        el.className = className;
-        if (text) el.textContent = text;
-        return el;
-    };
-    const frame = element('div', 'hg-session-frame');
-    const bar = element('header', 'hg-session-bar' + (onHome ? ' hg-session-has-home' : ''));
-    bar.setAttribute('aria-label', 'Game session');
-    if (onHome) {
-        const home = element(typeof onHome === 'string' ? 'a' : 'button', 'hg-session-home', '⌂ Home');
-        if (typeof onHome === 'string') home.href = onHome;
-        else { home.type = 'button'; home.onclick = onHome; }
-        bar.appendChild(home);
-    }
-    const titleEl = element('h1', 'hg-session-title', title || 'Homegames');
-    titleEl.title = title || 'Homegames';
-    bar.appendChild(titleEl);
-    const status = element('p', 'hg-session-status', options.status || 'Playing locally');
-    status.setAttribute('role', 'status');
-    status.setAttribute('aria-atomic', 'true');
-    bar.appendChild(status);
-
-    const gameArea = element('div', 'hg-session-game');
+    const frame = document.createElement('div'); frame.className = 'hg-session-frame';
+    const toolbar = createPlayerToolbar(window, { title, home: onHome, status: options.status || 'Playing locally',
+        onOpen: options.onOpen || share?.onOpen, onClose: options.onClose || share?.onClose });
+    toolbar.bar.classList.add('hg-session-bar');
+    if (options.onExports) toolbar.setAction('exports', { label: 'View exports', run: options.onExports });
+    const gameArea = document.createElement('div'); gameArea.className = 'hg-session-game';
     gameArea.id = `${containerId}-hg-local-area`;
-    frame.appendChild(bar);
-    frame.appendChild(gameArea);
-    container.appendChild(frame);
+    frame.append(toolbar.bar, gameArea); container.append(frame);
     let dialog;
     if (share) {
-        const button = element('button', 'hg-session-share', 'Share');
-        button.type = 'button';
-        button.setAttribute('aria-haspopup', 'dialog');
         dialog = require('./share-dialog')({ container: frame, ...share });
-        button.onclick = () => dialog.show();
+        toolbar.setAction('share', { label: 'Share', run: () => dialog.show() });
         if (share.onVisibility) {
-            const label = element('label', 'hg-session-private');
-            label.title = 'Hide this session from public games. Anyone with your invitation can still join.';
-            const privateCheck = document.createElement('input');
-            privateCheck.type = 'checkbox'; privateCheck.checked = share.private;
-            privateCheck.setAttribute('aria-label', 'Private game');
-            label.appendChild(privateCheck);
-            label.appendChild(element('span', 'hg-session-switch'));
-            label.appendChild(element('span', '', 'Private'));
-            privateCheck.onchange = async () => {
-                const desired = privateCheck.checked;
-                privateCheck.disabled = true;
-                try { await share.onVisibility(desired ? 'private' : 'public'); }
-                catch (err) { privateCheck.checked = !desired; status.textContent = err.message; status.title = err.message; }
-                finally { privateCheck.disabled = false; }
-            };
-            bar.appendChild(label);
+            let privateGame = share.private;
+            const update = () => toolbar.setAction('privacy', { label: privateGame ? 'Make session public' : 'Make session private', run: async () => {
+                await share.onVisibility(privateGame ? 'public' : 'private'); privateGame = !privateGame; update();
+            } }); update();
         }
-        bar.appendChild(button);
     }
     let disposed = false;
-    return { bar, gameArea, containerId: gameArea.id,
-        setStatus(text) { status.textContent = text; status.title = text; },
-        dispose() {
-            if (disposed) return;
-            disposed = true;
-            dialog?.dispose(); frame.remove(); releaseStyles();
-        },
+    return { bar: toolbar.bar, toolbar, gameArea, containerId: gameArea.id,
+        setStatus: text => toolbar.setStatus(text),
+        dispose() { if (disposed) return; disposed = true; dialog?.dispose(); toolbar.dispose(); frame.remove(); releaseStyles(); },
     };
 };
-
+createLocalChrome.addExportsButton = (bar, onExports) => {
+    const toolbar = bar.homegamesToolbar;
+    toolbar?.setAction('exports', { label: 'View exports', run: onExports });
+    return () => toolbar?.setAction('exports', null);
+};
 module.exports = createLocalChrome;

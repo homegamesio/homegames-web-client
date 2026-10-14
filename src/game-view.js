@@ -34,7 +34,11 @@ class GameView {
             || this.cursor?.size?.width !== cursor?.size?.width
             || this.cursor?.size?.height !== cursor?.size?.height) this._cursorRaster = null;
         this.cursor = cursor && { assetKey: cursor.assetKey, hotspot: { ...cursor.hotspot },
-            ...(cursor.size ? { size: { ...cursor.size } } : {}) };
+            ...(cursor.size ? { size: { ...cursor.size } } : {}),
+            ...(cursor.pointerLock !== undefined ? { pointerLock: cursor.pointerLock } : {}) };
+        // A menu can explicitly keep its pointer free. Cursor artwork alone
+        // never changes capture, and clearing it only allows a later gesture.
+        this.inputHandler.setPointerLockSuspended(cursor?.pointerLock === false);
         this.refreshCursor();
     }
 

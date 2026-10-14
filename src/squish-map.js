@@ -4,12 +4,12 @@
 // dependency. Requires must stay static so webpack can bundle them.
 
 const squishMap = {
-    '142': require('squish-142'),
-    '143': require('squish-143'),
-    '145': require('squish-145')
+    '142': require('./codecs/squish-142'),
+    '143': require('./codecs/squish-143'),
+    '145': require('./codecs/squish-145'),
+    '146': require('squish-146')
 };
 
 const DEFAULT_VERSION = '142';
-for (const squish of Object.values(squishMap)) require('homegames-common/stream-node').installStreamNode(squish.GameNode);
 
 module.exports = { squishMap, DEFAULT_VERSION };

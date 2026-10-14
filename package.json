@@ -14,7 +14,7 @@
   "dependencies": {
     "buffer": "^6.0.3",
     "homegames-common": "file:../homegames-common",
-    "homepad": "file:../homepad",
+    "homepad": "0.2.0",
     "qrcode-generator": "^2.0.4"
   },
   "devDependencies": {

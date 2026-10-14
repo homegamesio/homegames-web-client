@@ -1,3 +1,4 @@
+const { ProjectTransferClient, CONTROL: PROJECT_CONTROL, CHUNK: PROJECT_CHUNK } = require('homegames-common/project-transfer');
 const SessionController = require('./session-controller');
 const createLocalChrome = require('./local-game-chrome');
 const { loadLocalGame, loadHomeGame } = require('./local-game-loader');
@@ -73,6 +74,10 @@ class HomegamesClient {
         // the server runs the broadcast save backend (opcodes 10/11).
         this.saveStore = opts.saveStore || createSaveStore();
 
+        this.platform = opts.platform;
+        this.showChrome = opts.chrome !== false;
+        this.onSessionStatus = opts.onSessionStatus || (() => {});
+        this.localHome = opts.localHome;
         this.ws = null;
         this.worker = null;
         this.view = null;
@@ -96,21 +101,25 @@ class HomegamesClient {
             loadLocal: opts.loadLocalGame || loadHomeGame,
             mountLocal: game => {
                 this._shareOptions = typeof opts.share === 'function' ? opts.share(game) : opts.share;
-                return createLocalChrome(this.containerId, game.name || game.gameKey,
+                if (!this.showChrome) return { containerId: this.containerId, dispose() {} };
+                const chrome = createLocalChrome(this.containerId, game.name || game.gameKey,
                 opts.localHome === false ? null : typeof opts.localHome === 'string' ? opts.localHome : () => this.exitLocalGame(), this._shareOptions ? {
                     getLink: () => this._getRtcHost().share(),
                     private: this._shareOptions.visibility !== 'public',
                     onVisibility: this._shareOptions.room ? visibility => this._getRtcHost().setVisibility(visibility) : null,
                     onOpen: () => this._localSession?.inputHandler?.detach(),
                     onClose: () => this._localSession?.inputHandler?.attach(),
-                } : null);
+                } : null, { onExports: () => this.viewExports(),
+                    onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true) });
+                this._configureToolbar(chrome.toolbar);
+                return chrome;
             },
             createLocal: game => new LocalSession({ ...game,
-                gamepad: this.gamepadOptions, saveStore: this.saveStore,
+                gamepad: this.gamepadOptions, platform: opts.platform, saveStore: this.saveStore,
                 onSaveData: this.onSaveData, onError: this.onError, onReady: id => {
                     this.onReady(id);
                     if (this._shareOptions?.autoStart) {
-                        this._getRtcHost().share().catch(err => this._localChrome?.setStatus(`Not available to join: ${err.message}. Use Share to retry.`));
+                        this._getRtcHost().share().catch(err => this._localChrome?.setStatus?.(`Not available to join: ${err.message}. Use Share to retry.`));
                     }
                 },
             }),
@@ -122,7 +131,11 @@ class HomegamesClient {
      * Connect to the game session and start rendering.
      */
     start() { this._sessions.start(); }
-    stop() { this._sessions.stop(); }
+    stop() {
+        this._shareDialog?.dispose(); this._shareDialog = null;
+        if (!this._switchingManual) { this._manualPairing?.dispose(); this._manualPairing = null; }
+        this._sessions.stop();
+    }
     get _localSession() { return this._sessions.local; }
     get _localChrome() { return this._sessions.chrome; }
 
@@ -131,7 +144,7 @@ class HomegamesClient {
         if (!session) throw new Error('The game is still loading');
         if (!this._rtcHost || this._rtcHost.session !== session) {
             this._rtcHost = new RtcHost(session, { ...this._shareOptions,
-                onStatus: text => this._localChrome?.setStatus(text) });
+                onStatus: text => { this._localChrome?.setStatus?.(text); this.onSessionStatus(text); } });
         }
         return this._rtcHost;
     }
@@ -140,10 +153,71 @@ class HomegamesClient {
         return (this._localSession && this._rtcHost?.getStats()) || this.transport?.getStats?.() || Promise.resolve(null);
     }
 
+    // The same Homegames protocol is used by in-process, RTC and WebSocket clients.
+    requestGameCopy() { return this._requestFile(); }
+    listExports() { return this.spectating && !this._localSession ? Promise.reject(new Error('Join as a player to view exports')) : this._requestFile({ kind: 'export-list' }); }
+    readExport(name) { return this.spectating && !this._localSession ? Promise.reject(new Error('Join as a player to save exports')) : this._requestFile({ kind: 'export', name }); }
+    async viewExports() {
+        if (this._exportsOpen) return;
+        this._exportsOpen = true;
+        const input = this._localSession?.inputHandler || this.inputHandler;
+        input?.detach();
+        try {
+            if (this.platform?.viewExports) await this.platform.viewExports();
+            else {
+                this._exportsViewer = require('homegames-common/exports-viewer').createExportsViewer(window, {
+                    list: () => this.listExports(), read: name => this.readExport(name) });
+                await this._exportsViewer.result;
+            }
+        } catch (error) { this.onError(error); }
+        finally {
+            this._exportsViewer = null; this._exportsOpen = false;
+            if (input && (input === this._localSession?.inputHandler || (input === this.inputHandler && this.rendering))) input.attach();
+        }
+    }
+    _requestFile(options) {
+        if (!this._projectTransfer) this._projectTransfer = new ProjectTransferClient({
+            importArchive: bytes => HomegamesClient.PortableProject.importArchive(bytes),
+            send: message => {
+                const local = this._localSession;
+                if (local) {
+                    if (!local.runtime || local.frozen || !local.players.some(player => player.playerId === local.playerId && player.dispatcher)) throw new Error('The game is not ready. Try again once it has loaded.');
+                    const transfer = this._projectTransfer;
+                    queueMicrotask(() => local.handleProjectMessage(local.playerId, message, bytes => {
+                        queueMicrotask(() => transfer.receive(bytes));
+                    }));
+                }
+                else this._send(JSON.stringify(message));
+            },
+        });
+        return this._projectTransfer.request(options);
+    }
+
     getShareLink() {
         if (this._localSession && this._shareOptions) return this._getRtcHost().share();
         if (this.transport?.getShareLink) return this.transport.getShareLink();
         throw new Error('This session is not available to share');
+    }
+
+    setInputEnabled(enabled) {
+        const input = this._localSession?.inputHandler || this.inputHandler;
+        if (enabled) input?.attach(); else input?.detach();
+    }
+
+    showShare() {
+        if (!this._shareDialog) this._shareDialog = require('./share-dialog')({ container: document.body,
+            getLink: () => this.getShareLink(), onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true) });
+        this._shareDialog.show();
+    }
+
+    _configureToolbar(toolbar) {
+        if (!toolbar) return;
+        toolbar.setAction('manual-connect', { label: 'Manual connection', run: () => {
+            if (!this._manualPairing) this._manualPairing = HomegamesClient.createManualPairing({ container: document.body,
+                getSession: () => this._localSession, onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true),
+                join: transport => { this._switchingManual = true; this.stop(); this.transportFactory = transport; this.start(); this._switchingManual = false; } });
+            this._manualPairing.show();
+        } });
     }
 
     get canvas() { return this.view?.canvas || null; }
@@ -154,11 +228,21 @@ class HomegamesClient {
     get rendering() { return this._loop.running; }
 
     _startRemote() {
-        const container = document.getElementById(this.containerId);
+        let container = document.getElementById(this.containerId);
         if (!container) {
             this.onError(new Error('Container element not found: #' + this.containerId));
             return;
         }
+
+        const bar = container.closest('.hg-session-frame')?.querySelector('.hg-session-bar');
+        if (this.showChrome && bar) this._removeExportsButton = createLocalChrome.addExportsButton(bar, () => this.viewExports());
+        else if (this.showChrome) {
+            this._remoteChrome = createLocalChrome(this.containerId, 'Homegames', typeof this.localHome === 'string' ? this.localHome : null,
+                null, { status: 'Connected game', onExports: () => this.viewExports(),
+                    onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true) });
+            container = this._remoteChrome.gameArea;
+        }
+        if (this.showChrome) this._configureToolbar((bar || this._remoteChrome?.bar)?.homegamesToolbar);
 
         this.view = new GameView({
             container, send: msg => this._send(msg),
@@ -175,21 +259,23 @@ class HomegamesClient {
         window.addEventListener('resize', this._resizeHandler);
 
         // --- Connect ---
+        const media = this._mediaClient = new MediaClient({ container, platform: this.platform, assets: this.assetManager,
+            send: message => this._send(JSON.stringify(message)),
+            publish: (id, stream) => this.transport?.addMedia?.(id, stream),
+            unpublish: id => this.transport?.removeMedia?.(id),
+        });
         if (this.transportFactory) {
-            const media = new MediaClient({ container, assets: this.assetManager,
-                send: message => this.transport?.send(JSON.stringify(message)),
-                publish: (id, stream) => this.transport?.addMedia?.(id, stream),
-                unpublish: id => this.transport?.removeMedia?.(id),
-            });
             const generation = this._transportGeneration = (this._transportGeneration || 0) + 1;
             const active = () => generation === this._transportGeneration;
             this.transport = this.transportFactory({
-                onOpen: () => { if (active()) this._send(JSON.stringify({ type: 'ready', media: 1, clientInfo: { clientInfo: getClientInfo() } })); },
+                onOpen: () => { if (active()) this._send(JSON.stringify({ type: 'ready', media: 1, recording: 2, clientInfo: { clientInfo: getClientInfo() } })); },
                 onMessage: data => { if (active() && data instanceof ArrayBuffer) this._handleBinaryMessage(new Uint8ClampedArray(data)); },
                 onMedia: message => { if (active()) media.receive(message); },
                 onTrack: stream => { if (active()) media.attach(stream); },
                 onError: err => { if (active()) this.onError(err); },
-                onClose: () => { if (active()) { this._loop.stop(); this.view?.setCursor(null); this.inputHandler?.detach(); this.renderer?.stopAllSounds(); media.destroy(); this.onClose(); } },
+                // Previous close handler retained while mouse capture is introduced.
+                // onClose: () => { if (active()) { this._loop.stop(); this.view?.setCursor(null); this.inputHandler?.detach(); this.renderer?.stopAllSounds(); media.destroy(); this.onClose(); } },
+                onClose: () => { if (active()) { this._loop.stop(); this.view?.setCursor(null); this.inputHandler?.setPointerLockEnabled(false); this.inputHandler?.detach(); this.renderer?.stopAllSounds(); media.destroy(); this.onClose(); } },
             });
         } else if (this.workerUrl) {
             this._connectWorker();
@@ -202,7 +288,13 @@ class HomegamesClient {
      * Disconnect and clean up everything.
      */
     _stopRemote() {
+        this._exportsViewer?.close();
+        this.platform?.closeExports?.();
+        this._removeExportsButton?.(); this._removeExportsButton = null;
+        this._mediaClient?.destroy(); this._mediaClient = null;
+        this._projectTransfer?.close(); this._projectTransfer = null;
         this._transportGeneration = (this._transportGeneration || 0) + 1;
+        this.inputHandler?.setPointerLockEnabled(false);
         this.transport?.close(); this.transport = null;
         this._loop.stop();
 
@@ -221,6 +313,7 @@ class HomegamesClient {
 
         this.view?.destroy();
         this.view = null;
+        this._remoteChrome?.dispose(); this._remoteChrome = null;
 
         if (this._resizeHandler) {
             window.removeEventListener('resize', this._resizeHandler);
@@ -282,6 +375,7 @@ class HomegamesClient {
             if (this.ws !== ws) return;
             this._loop.stop();
             this.view?.setCursor(null);
+            this.inputHandler?.setPointerLockEnabled(false);
             this.onClose();
         };
 
@@ -323,6 +417,7 @@ class HomegamesClient {
             } else if (data && data.type === 'close') {
                 this._loop.stop();
                 this.view?.setCursor(null);
+                this.inputHandler?.setPointerLockEnabled(false);
                 this.onClose();
             } else if (data && data.type === 'error') {
                 this.onError(new Error(data.message));
@@ -343,10 +438,13 @@ class HomegamesClient {
     // -----------------------------------------------------------------------
 
     _reconnect(newWsUrl) {
+        this._exportsViewer?.close(); this.platform?.closeExports?.();
+        this._projectTransfer?.close(); this._projectTransfer = null;
         this.wsUrl = newWsUrl;
         this._loop.stop();
         this.currentBuf = null;
         this.view?.setCursor(null);
+        this.inputHandler?.setPointerLockEnabled(false);
 
         // Clear stale state from previous session
         if (this.renderer) {
@@ -379,8 +477,16 @@ class HomegamesClient {
         const msgType = buf[0];
 
         switch (msgType) {
+            case 16: // Homegames recorded-media control (WebSocket hosts)
+                try { this._mediaClient?.receive(JSON.parse(new TextDecoder().decode(buf.subarray(1)))); } catch (_) {}
+                break;
+            case PROJECT_CONTROL:
+            case PROJECT_CHUNK:
+                void this._projectTransfer?.receive(buf);
+                break;
             case 2: // Init message
                 this._handleInit(buf);
+                if (!this.transportFactory) this._send(JSON.stringify({type:'media',action:'hello',recording:2}));
                 break;
 
             case 1: // Asset bundle
@@ -520,6 +626,9 @@ class HomegamesClient {
 
     _handleInit(buf) {
         this.playerId = buf[1];
+        // A fresh init is a new input contract. Old/short init messages must
+        // clear a previous game's opt-in instead of inheriting mouse capture.
+        this.inputHandler?.setPointerLockEnabled(false);
 
         if (buf.length <= 2) return;
 
@@ -536,8 +645,9 @@ class HomegamesClient {
         if (squishModule) {
             this.unsquish = squishModule.unsquish;
         } else {
-            console.warn('Unknown squish version: ' + svStr + ', falling back to ' + DEFAULT_VERSION);
-            this.unsquish = squishMap[DEFAULT_VERSION].unsquish;
+            this.stop();
+            this.onError(new Error('Unsupported Squish runtime: squish-' + svStr));
+            return;
         }
 
         // Update input handler
@@ -548,6 +658,8 @@ class HomegamesClient {
             // contract (mousemove while held), older versions get legacy
             // repeated clicks.
             this.inputHandler.squishVersion = svStr;
+            const inputFlags = buf[7 + svLen] || 0;
+            this.inputHandler.setPointerLockEnabled((inputFlags & 1) !== 0);
         }
 
         this._initCanvas();
@@ -619,8 +731,13 @@ HomegamesClient.createRtcTransport = createRtcTransport;
 HomegamesClient.readInvitation = readInvitation;
 HomegamesClient.RtcHost = RtcHost;
 HomegamesClient.createShareDialog = require('./share-dialog');
+HomegamesClient.GameCopies = require('./rtc-copy');
 HomegamesClient.createSessionFrame = createLocalChrome;
+HomegamesClient.createPlayerToolbar = require('homegames-common/player-toolbar').createPlayerToolbar;
 HomegamesClient.householdRoom = require('./household-room');
+HomegamesClient.PortableProject = require('./portable-project');
+HomegamesClient.ManualRtc = require('./rtc-manual');
+HomegamesClient.createManualPairing = require('./manual-pairing-ui');
 
 // Export for both CommonJS and browser global
 if (typeof module !== 'undefined' && module.exports) {

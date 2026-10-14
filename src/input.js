@@ -54,6 +54,34 @@ class InputHandler {
 
         this.gamepads = gamepadOptions === false ? null : new GamepadInput(sendFn, gamepadOptions);
         this._focused = true;
+        this.pointerLockEnabled = false;
+        this.pointerLockSuspended = false;
+        this._pointerLocked = false;
+        this._pointerLockPending = false;
+        this._pointerLockCancelled = false;
+        this._pointerLockOnRelease = false;
+        this._pointerDelta = { dx: 0, dy: 0 };
+        this._lastPointerMove = 0;
+    }
+
+    // A game may opt in, but only a physical canvas mouse gesture requests
+    // capture. Unsupported or denied requests keep the ordinary drag controls.
+    setPointerLockEnabled(enabled) {
+        this.pointerLockEnabled = enabled === true;
+        if (!this.pointerLockEnabled) this._releasePointerCapture();
+    }
+
+    // Menus may suspend an opted-in game's capture for one player without
+    // changing the game's capability or requesting a lock outside a gesture.
+    setPointerLockSuspended(suspended) {
+        const value = suspended === true;
+        if (this.pointerLockSuspended === value) return;
+        this.pointerLockSuspended = value;
+        if (value) this._releasePointerCapture();
+    }
+
+    _canCapturePointer() {
+        return this.pointerLockEnabled && !this.pointerLockSuspended;
     }
 
     attach() {
@@ -62,8 +90,12 @@ class InputHandler {
         this._focused = typeof document.hasFocus !== 'function' || document.hasFocus();
 
         const h = this._boundHandlers;
+        // Reattach can happen while a previous native request is settling.
+        document.removeEventListener('pointerlockchange', h.pointerlockchange);
+        document.removeEventListener('pointerlockerror', h.pointerlockerror);
 
         h.mousedown = (e) => {
+            this._pointerLockOnRelease = false;
             if (this._isControlEvent(e)) return;
             // A new physical press must not be swallowed by the previous
             // press's repeat throttle (especially short push-to-talk bursts).
@@ -72,21 +104,56 @@ class InputHandler {
             this._touchActive = false;
             this.mouseDown = true;
             this._pressClickSent = false;
-            this.mousePos = [e.clientX, e.clientY];
-            this._lastClientPos = [e.clientX, e.clientY];
+            this.mousePos = this._hasPointerLock() ? this._canvasCenter() : [e.clientX, e.clientY];
+            this._lastClientPos = this.mousePos.slice();
             this.assetManager.unlockAudio();
+            const captureGesture = this._canCapturePointer() && !this.spectating &&
+                e.target === this.canvas && e.button === 0 && !e.sourceCapabilities?.firesTouchEvents &&
+                !this._hasPointerLock() && !this._pointerLockPending &&
+                typeof this.canvas.requestPointerLock === 'function';
+            // An iframe's first mousedown can arrive before its native focus
+            // event. Complete that same gesture on mouseup once focus arrives.
+            this._pointerLockOnRelease = captureGesture && !this._focused;
+            if (captureGesture && this._focused) {
+                // Deliver the acquisition press at its original coordinates
+                // exactly once (e.g. an Enter button), before capture centers
+                // future clicks. The native request must stay in this gesture.
+                this._sendPendingClick(this._canClick(this.mousePos[0], this.mousePos[1]));
+                // A local click can synchronously stop/redirect its session.
+                if (!this._attached || !this._canCapturePointer() || !this._focused || this.spectating) return;
+                this.clickStopper = setTimeout(() => { this.clickStopper = null; }, 30);
+                this._requestPointerLock();
+            }
         };
 
         h.mouseup = (e) => {
             this.assetManager.liveMedia?.release('pointer');
-            this.mousePos = [e.clientX, e.clientY];
-            this._lastClientPos = [e.clientX, e.clientY];
-            this._sendPendingClick(this._canClick(e.clientX, e.clientY));
+            this.mousePos = this._hasPointerLock() ? this._canvasCenter() : [e.clientX, e.clientY];
+            this._lastClientPos = this.mousePos.slice();
+            const releasePos = this.mousePos.slice();
+            this._sendPendingClick(this._canClick(this.mousePos[0], this.mousePos[1]));
+            // Teardown already releases the press and clears mousePos.
+            if (!this._attached) return;
             this.mouseDown = false;
-            this._sendMouseUp(e.clientX, e.clientY);
+            this._sendMouseUp(releasePos[0], releasePos[1]);
+            const captureOnRelease = this._pointerLockOnRelease;
+            this._pointerLockOnRelease = false;
+            if (captureOnRelease && this._attached && this._canCapturePointer() && this._focused && !this.spectating &&
+                e.target === this.canvas && e.button === 0 && !e.sourceCapabilities?.firesTouchEvents &&
+                !this._hasPointerLock() && !this._pointerLockPending) this._requestPointerLock();
         };
 
         h.mousemove = (e) => {
+            if (this._hasPointerLock()) {
+                if (this.mouseDown && e.buttons === 0) this._releasePointerPress();
+                if (Number.isFinite(e.movementX) && Number.isFinite(e.movementY)) {
+                    // Relative CSS pixels, bounded to the dispatcher's wire
+                    // limit even if a stalled frame accumulates many events.
+                    this._pointerDelta.dx = Math.max(-4096, Math.min(4096, this._pointerDelta.dx + e.movementX));
+                    this._pointerDelta.dy = Math.max(-4096, Math.min(4096, this._pointerDelta.dy + e.movementY));
+                }
+                return; // Captured motion must never also become a drag.
+            }
             // If we think the button is down but nothing is actually pressed,
             // the mouseup happened outside the window where our listener can't
             // fire. Clear the stale state so we don't fire phantom clicks when
@@ -100,6 +167,7 @@ class InputHandler {
         };
 
         h.touchstart = (e) => {
+            this._pointerLockOnRelease = false;
             // This handler sits on window, and preventDefault on touchstart
             // suppresses the synthesized click for whatever was tapped — on an
             // embedding page (the Studio on mobile) that kills every button
@@ -170,6 +238,10 @@ class InputHandler {
             // Frame controls own Enter/Space and text input. Do not let the
             // document-level game listener cancel their native activation.
             if (this._isControlEvent(e)) return;
+            if (e.key === 'Escape' && (this._hasPointerLock() || this._pointerLockPending || this._pointerLockOnRelease)) {
+                this._releasePointerCapture();
+                return;
+            }
             if (e.key === ' ') this.assetManager.liveMedia?.hold('space');
             this.assetManager.unlockAudio();
             if (this._keyMatters(e) && !this.keysDown['Meta']) {
@@ -222,23 +294,34 @@ class InputHandler {
 
         h.blur = () => {
             this._focused = false;
-            this.gamepads?.release();
-            this._releaseKeys();
             // Window lost focus (alt-tab, switched app) while the button was
             // held — we won't get the mouseup, so clear the held state and
             // tell the server the press ended where we last saw the pointer.
-            if (this.mouseDown && this._lastClientPos) {
-                this._sendMouseUp(this._lastClientPos[0], this._lastClientPos[1]);
-            }
-            this.mouseDown = false;
+            this._releasePointerCapture();
         };
 
         h.focus = () => { this._focused = true; };
         h.visibilitychange = () => {
             if (document.hidden) {
-                this.gamepads?.release();
-                this._releaseKeys();
+                this._releasePointerCapture();
             }
+        };
+        h.pointerlockchange = () => {
+            const wasLocked = this._pointerLocked;
+            this._pointerLocked = this._hasPointerLock();
+            this._pointerLockPending = false;
+            this._clearPointerDelta();
+            if (this._pointerLocked && (!this._attached || !this._canCapturePointer() ||
+                this._pointerLockCancelled || this.spectating || !this._focused)) {
+                this._releasePointerCapture();
+            } else if (wasLocked && !this._pointerLocked) {
+                this._releasePointerCapture();
+            }
+            this._removeDetachedPointerLockListeners();
+        };
+        h.pointerlockerror = () => {
+            this._pointerLockPending = false;
+            this._removeDetachedPointerLockListeners();
         };
 
         window.addEventListener('mousedown', h.mousedown);
@@ -247,6 +330,8 @@ class InputHandler {
         window.addEventListener('blur', h.blur);
         window.addEventListener('focus', h.focus);
         document.addEventListener('visibilitychange', h.visibilitychange);
+        document.addEventListener('pointerlockchange', h.pointerlockchange);
+        document.addEventListener('pointerlockerror', h.pointerlockerror);
         window.addEventListener('touchstart', h.touchstart, { passive: false });
         this.canvas.addEventListener('touchmove', h.touchmove, { passive: false });
         window.addEventListener('touchend', h.touchend);
@@ -256,11 +341,11 @@ class InputHandler {
     }
 
     detach() {
+        this._textDialog?.close(); this._textDialog?.remove(); this._textDialog = null;
         if (!this._attached) return;
         this.assetManager.liveMedia?.release();
         this._attached = false;
-        this.gamepads?.release();
-        this._releaseKeys();
+        this._releasePointerCapture();
 
         const h = this._boundHandlers;
         window.removeEventListener('mousedown', h.mousedown);
@@ -269,6 +354,7 @@ class InputHandler {
         window.removeEventListener('blur', h.blur);
         window.removeEventListener('focus', h.focus);
         document.removeEventListener('visibilitychange', h.visibilitychange);
+        this._removeDetachedPointerLockListeners();
         window.removeEventListener('touchstart', h.touchstart);
         this.canvas.removeEventListener('touchmove', h.touchmove);
         window.removeEventListener('touchend', h.touchend);
@@ -297,6 +383,17 @@ class InputHandler {
         if (this._focused && !document.hidden && !this.spectating) this.gamepads?.tick();
         else this.gamepads?.release();
 
+        // A rolling 60 Hz deadline tolerates Date.now()'s integer rounding and
+        // rAF jitter without accidentally halving look updates to 30 Hz.
+        const pointerInterval = 1000 / 60;
+        if (this._canCapturePointer() && this._hasPointerLock() && this._focused && !document.hidden && !this.spectating &&
+            nowTs - this._lastPointerMove >= pointerInterval - 1 && (this._pointerDelta.dx || this._pointerDelta.dy)) {
+            this.send(JSON.stringify({ type: 'pointermove', data: { ...this._pointerDelta } }));
+            this._pointerDelta.dx = this._pointerDelta.dy = 0;
+            this._lastPointerMove = this._lastPointerMove && nowTs - this._lastPointerMove < pointerInterval * 2 ?
+                this._lastPointerMove + pointerInterval : nowTs;
+        }
+
         if (!this.mousePos) return;
 
         const clickInfo = this._canClick(this.mousePos[0], this.mousePos[1]);
@@ -313,6 +410,8 @@ class InputHandler {
             if (!this._pressClickSent) {
                 this._pressClickSent = true;
                 this._handleClick(clickInfo, true);
+            } else if (this._hasPointerLock()) {
+                // Captured presses fire once; relative look is sent separately.
             } else if (this._usesSingleClickContract()) {
                 this._sendMouseMove(this.mousePos[0], this.mousePos[1]);
             } else {
@@ -342,6 +441,67 @@ class InputHandler {
     }
 
     // --- Private ---
+
+    _hasPointerLock() {
+        return document.pointerLockElement === this.canvas;
+    }
+
+    _canvasCenter() {
+        const rect = this.canvas.getBoundingClientRect();
+        return [rect.left + rect.width / 2, rect.top + rect.height / 2];
+    }
+
+    _requestPointerLock() {
+        if (!this._canCapturePointer()) return;
+        this._pointerLockCancelled = false;
+        this._pointerLockPending = true;
+        try {
+            const request = this.canvas.requestPointerLock();
+            // Older browsers return void and report the result through events.
+            if (request?.then) request.then(() => {
+                this._boundHandlers.pointerlockchange();
+            }, () => {
+                this._boundHandlers.pointerlockerror();
+            });
+        } catch (_) {
+            this._boundHandlers.pointerlockerror();
+        }
+    }
+
+    _clearPointerDelta() {
+        this._pointerDelta.dx = this._pointerDelta.dy = 0;
+        this._lastPointerMove = 0;
+    }
+
+    _releasePointerPress() {
+        this._pointerLockOnRelease = false;
+        this.assetManager.liveMedia?.release('pointer');
+        if (this.mouseDown && this._lastClientPos) this._sendMouseUp(...this._lastClientPos);
+        this.mouseDown = false;
+        this._pressClickSent = false;
+        this.mousePos = null;
+        this._lastClientPos = null;
+        clearTimeout(this.clickStopper); this.clickStopper = null;
+    }
+
+    _releasePointerCapture() {
+        this._pointerLockCancelled = true;
+        this.assetManager.liveMedia?.release();
+        this.gamepads?.release();
+        this._releaseKeys();
+        this._releasePointerPress();
+        this._clearPointerDelta();
+        // Another local player's canvas (or the embedding page) owns its lock.
+        if (this._hasPointerLock()) document.exitPointerLock?.();
+    }
+
+    _removeDetachedPointerLockListeners() {
+        if (this._attached || this._pointerLockPending) return;
+        // A request can finish after detach. Keep only these two listeners
+        // until it settles so a late acquisition is immediately released.
+        document.removeEventListener('pointerlockchange', this._boundHandlers.pointerlockchange);
+        document.removeEventListener('pointerlockerror', this._boundHandlers.pointerlockerror);
+    }
 
     _releaseKeys() {
         for (const timer of Object.values(this._keyUpTimers || {})) clearTimeout(timer);
@@ -415,17 +575,32 @@ class InputHandler {
         this._handleClick(clickInfo, true);
     }
 
+    _promptTextInput(nodeId) {
+        if (this._textDialog) return;
+        const dialog = document.createElement('dialog'), form = document.createElement('div');
+        const label = document.createElement('label'), input = document.createElement('input');
+        const save = document.createElement('button'), cancel = document.createElement('button');
+        dialog.setAttribute('aria-label', 'Input text');
+        dialog.style.cssText = 'max-width:90vw;padding:24px;border-radius:12px;background:#101820;color:white;font:16px system-ui';
+        label.textContent = 'Input text'; input.type = 'text'; input.maxLength = 4096;
+        input.style.cssText = 'display:block;width:min(300px,65vw);padding:10px;margin:12px 0;font:inherit';
+        label.append(input); save.textContent = 'Done'; save.type = 'button'; cancel.textContent = 'Cancel'; cancel.type = 'button';
+        for (const button of [save,cancel]) button.style.cssText = 'padding:8px 16px;margin-right:8px;font:inherit';
+        const close = () => { dialog.close(); dialog.remove(); this._textDialog = null; };
+        save.onclick = event => { event.preventDefault(); const value = input.value; close(); this.send(JSON.stringify({type:'input',input:value,nodeId})); };
+        input.onkeydown = event => { if (event.key === 'Enter') save.onclick(event); };
+        cancel.onclick = close; dialog.oncancel = event => { event.preventDefault(); close(); };
+        form.append(label,save,cancel); dialog.append(form); document.body.append(dialog);
+        this._textDialog = dialog; dialog.showModal(); input.focus();
+    }
+
     _handleClick(clickInfo, isNewPress) {
         if (!this.mousePos) return;
 
         if (clickInfo.action) {
             if (clickInfo.action === 'text') {
                 this.mouseDown = false;
-                const textInput = prompt('Input text');
-                // A cancelled prompt returns null — nothing to deliver.
-                if (textInput !== null) {
-                    this.send(JSON.stringify({ type: 'input', input: textInput, nodeId: clickInfo.nodeId }));
-                }
+                this._promptTextInput(clickInfo.nodeId);
             } else if (clickInfo.action === 'file') {
                 this.mouseDown = false;
                 // Touch taps open the picker synchronously from touchend

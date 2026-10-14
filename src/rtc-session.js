@@ -192,6 +192,8 @@ class RtcHost {
                         seat = this.session.addRemotePlayer({ send: (bytes, options) => peer.channel.send(bytes, options),
                             close: () => peer.close(), clientInfo: ready.clientInfo?.clientInfo || {} });
                         if (ready.media === 1) this.session.media?.join(seat.playerId, {
+                            recording: ready.recording === 1 || ready.recording === 2,
+                            audioRecording: ready.recording === 2,
                             send: message => peer.channel.send(JSON.stringify(message)),
                             addMedia: (id, stream) => peer.addMedia(id, stream),
                             removeMedia: id => peer.removeMedia(id),
@@ -294,4 +296,4 @@ const readInvitation = (hash = window.location.hash) => {
     return { roomId: params.get('room'), invite: params.get('invite'), signalingUrl: params.get('signal') };
 };
 
-module.exports = { RtcHost, createRtcTransport, readInvitation };
+module.exports = { RtcHost, createRtcTransport, readInvitation, Peer, signalUrl };
