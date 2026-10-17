@@ -15,6 +15,7 @@ const loadLocalGame = async ({ manifestUrl, gameKey, versionId, baseUrl } = {}, 
     }
     return {
         name: manifest.name,
+        author: manifest.author || manifest.createdBy,
         multiplayer: manifest.multiplayer === true,
         files: manifest.files,
         entryPoint: manifest.entryPoint,

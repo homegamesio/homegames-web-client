@@ -9,6 +9,8 @@ const saves = require('homegames-common/portable-saves');
 const portableClient = require('homegames-common/portable-client');
 
 module.exports = {
+    ...require('homegames-common/studio-debug'),
+    ...require('homegames-common/studio-handoff'),
     create: files => project.createProject(files, options),
     importArchive: bytes => project.importArchive(bytes, options),
     exportArchive: project.exportArchive,
@@ -36,5 +38,6 @@ module.exports = {
     readHtmlArchive: html.readHtmlArchive,
     htmlBytesLimit: html.htmlBytesLimit,
     checkSyntax: project.checkSyntax,
+    thumbnailPath: project.thumbnailPath,
     prepareTrustedLocalGame: (value, settings) => prepareTrustedLocalGame(value, squishMap, settings),
 };

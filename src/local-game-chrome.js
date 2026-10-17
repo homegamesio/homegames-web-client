@@ -7,7 +7,7 @@ const createLocalChrome = (containerId, title, onHome, share = null, options = {
     container.innerHTML = '';
     const releaseStyles = useFrameStyles();
     const frame = document.createElement('div'); frame.className = 'hg-session-frame';
-    const toolbar = createPlayerToolbar(window, { title, home: onHome, status: options.status || 'Playing locally',
+    const toolbar = createPlayerToolbar(window, { title, author: options.author, home: onHome, status: options.status || 'Playing locally',
         onOpen: options.onOpen || share?.onOpen, onClose: options.onClose || share?.onClose });
     toolbar.bar.classList.add('hg-session-bar');
     if (options.onExports) toolbar.setAction('exports', { label: 'View exports', run: options.onExports });

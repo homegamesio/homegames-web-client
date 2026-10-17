@@ -111,7 +111,7 @@ class HomegamesClient {
                     onVisibility: this._shareOptions.room ? visibility => this._getRtcHost().setVisibility(visibility) : null,
                     onOpen: () => this._localSession?.inputHandler?.detach(),
                     onClose: () => this._localSession?.inputHandler?.attach(),
-                } : null, { onExports: () => this.viewExports(),
+                } : null, { author: game.author, onExports: () => this.viewExports(),
                     onOpen: () => this.setInputEnabled(false), onClose: () => this.setInputEnabled(true) });
                 this._configureToolbar(chrome.toolbar);
                 return chrome;

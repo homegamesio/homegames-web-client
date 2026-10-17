@@ -106,6 +106,7 @@ class InputHandler {
             this._pressClickSent = false;
             this.mousePos = this._hasPointerLock() ? this._canvasCenter() : [e.clientX, e.clientY];
             this._lastClientPos = this.mousePos.slice();
+            this._pressOrigin = this.mousePos.slice();
             this.assetManager.unlockAudio();
             const captureGesture = this._canCapturePointer() && !this.spectating &&
                 e.target === this.canvas && e.button === 0 && !e.sourceCapabilities?.firesTouchEvents &&
@@ -178,6 +179,11 @@ class InputHandler {
                 return;
             }
             e.preventDefault();
+            // Claiming a canvas touch suppresses the synthesized mouse click
+            // that would normally focus an embedded game. Treat this direct
+            // gesture as input focus so the first tap can reach the game too.
+            // Page-control touches return above; blur still releases input.
+            this._focused = true;
             this._touchActive = true;
             clearTimeout(this.clickStopper); this.clickStopper = null;
             this.assetManager.liveMedia?.hold('pointer');
@@ -185,6 +191,7 @@ class InputHandler {
             this._pressClickSent = false;
             this.mousePos = [e.touches[0].clientX + window.scrollX, e.touches[0].clientY + window.scrollY];
             this._lastClientPos = [e.touches[0].clientX, e.touches[0].clientY];
+            this._pressOrigin = this.mousePos.slice();
             this.assetManager.unlockAudio();
         };
 
@@ -229,7 +236,7 @@ class InputHandler {
             // report the release at the last known position so the server can
             // close out the press (drag-end / offClick).
             if (this.mouseDown && this._lastClientPos) {
-                this._sendMouseUp(this._lastClientPos[0], this._lastClientPos[1]);
+                this._sendMouseUp(this._lastClientPos[0], this._lastClientPos[1], true);
             }
             this.mouseDown = false;
         };
@@ -408,8 +415,7 @@ class InputHandler {
         //   click contract those games' interactions were built on.
         if (this.mouseDown && !this.clickStopper) {
             if (!this._pressClickSent) {
-                this._pressClickSent = true;
-                this._handleClick(clickInfo, true);
+                this._sendPendingClick(clickInfo);
             } else if (this._hasPointerLock()) {
                 // Captured presses fire once; relative look is sent separately.
             } else if (this._usesSingleClickContract()) {
@@ -476,7 +482,7 @@ class InputHandler {
     _releasePointerPress() {
         this._pointerLockOnRelease = false;
         this.assetManager.liveMedia?.release('pointer');
-        if (this.mouseDown && this._lastClientPos) this._sendMouseUp(...this._lastClientPos);
+        if (this.mouseDown && this._lastClientPos) this._sendMouseUp(...this._lastClientPos, true);
         this.mouseDown = false;
         this._pressClickSent = false;
         this.mousePos = null;
@@ -524,7 +530,7 @@ class InputHandler {
             event.key === 'Escape' || event.key === 'Shift';
     }
 
-    _sendMouseUp(clientX, clientY) {
+    _sendMouseUp(clientX, clientY, cancelled = false) {
         const rect = this.canvas.getBoundingClientRect();
         const clickX = (clientX - rect.left) / rect.width * 100;
         const clickY = (clientY - rect.top) / rect.height * 100;
@@ -533,7 +539,16 @@ class InputHandler {
         // (drag-end / offClick), even ones that finish outside the canvas.
         const x = Math.min(99.99, Math.max(0, clickX));
         const y = Math.min(99.99, Math.max(0, clickY));
-        this.send(JSON.stringify({ type: 'mouseup', data: { x, y } }));
+        // Preserve the last movement even when the whole drag happened between
+        // animation frames or inside the 30ms repeat throttle.
+        const origin = this._pressOrigin;
+        if (!cancelled && origin && this._pressClickSent && !this._hasPointerLock() &&
+            (Math.abs(clientX - origin[0]) > .5 || Math.abs(clientY - origin[1]) > .5)) {
+            this._sendMouseMove(clientX, clientY);
+        }
+        this._pressOrigin = null;
+        // End the press on blur/touchcancel without committing a drag-and-drop.
+        this.send(JSON.stringify({ type: 'mouseup', data: { x, y, ...(cancelled ? { cancelled: true } : {}) } }));
     }
 
     // Whether the game's squish version uses the single-click contract
@@ -572,7 +587,15 @@ class InputHandler {
     _sendPendingClick(clickInfo) {
         if (!this.mouseDown || this._pressClickSent || this.spectating || !this._focused) return;
         this._pressClickSent = true;
+        // A pointer can move before the first animation frame. Its press still
+        // belongs to the original object, not whichever object it moved over.
+        const latest = this.mousePos;
+        if (this._pressOrigin) {
+            this.mousePos = this._pressOrigin.slice();
+            clickInfo = this._canClick(this.mousePos[0], this.mousePos[1]);
+        }
         this._handleClick(clickInfo, true);
+        if (this._attached) this.mousePos = latest;
     }
 
     _promptTextInput(nodeId) {

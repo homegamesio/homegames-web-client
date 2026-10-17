@@ -11,7 +11,13 @@ class GameView {
         container.innerHTML = '';
         Object.assign(container.style, { position: 'relative', overflow: 'hidden', background: '#000' });
         this.canvas = document.createElement('canvas');
-        Object.assign(this.canvas.style, { display: 'block', margin: '0 auto', cursor: 'default' });
+        Object.assign(this.canvas.style, {
+            display: 'block', margin: '0 auto', cursor: 'default',
+            // Keep iOS tap highlights and long-press selection off the game surface.
+            webkitTapHighlightColor: 'transparent',
+            webkitTouchCallout: 'none',
+            webkitUserSelect: 'none', userSelect: 'none',
+        });
         this.cursor = null;
         this.cursorOverride = null;
         this._cursorRaster = null;

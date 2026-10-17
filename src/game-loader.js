@@ -57,6 +57,15 @@ const loadGameClass = ({ files, entryPoint }) => {
         moduleCache[path] = module;
 
         const source = normalized[path];
+        if (path.endsWith('.json')) {
+            try {
+                module.exports = JSON.parse(source);
+                return module.exports;
+            } catch (err) {
+                delete moduleCache[path];
+                throw new Error('Invalid JSON module ' + path + ': ' + err.message);
+            }
+        }
         const fn = new Function('module', 'exports', 'require', '__filename', '__dirname', source);
         try {
             fn(module, module.exports, requireShim, path, dir);
