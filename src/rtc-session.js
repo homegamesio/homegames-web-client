@@ -112,6 +112,7 @@ class RtcHost {
         session.onStop = () => this.stop();
     }
     share() {
+        if (this.session.maxPlayers === 1) return Promise.reject(new Error('This is a solo game. Use Share a copy to send it to a friend.'));
         if (this.link) return Promise.resolve(this.link);
         if (this.pending) return this.pending;
         if (!this.session.game) return Promise.reject(new Error('The game is still loading'));

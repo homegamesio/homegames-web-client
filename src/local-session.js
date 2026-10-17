@@ -154,9 +154,12 @@ class LocalSession {
             return;
         }
 
-        // --- Resolve squish version from game metadata ---
-        const metadata = (typeof this.gameClass.metadata === 'function') ? this.gameClass.metadata() : {};
-        this.maxPlayers = Math.min(255, metadata.maxPlayers || 64);
+        // Loaders bind the statically resolved runtime; legacy class-only embeds
+        // retain their metadata/default compatibility path.
+        let metadata;
+        try { metadata = require('homegames-common/runtime-metadata').runtimeMetadata(this.gameClass); }
+        catch (error) { this.stop(); this.onError(error); return; }
+        this.maxPlayers = metadata.maxPlayers;
         this.pointerLockEnabled = metadata.pointerLock === true;
         const squishVersion = metadata.squishVersion || DEFAULT_VERSION;
         let squishModule = squishMap[squishVersion];
@@ -236,8 +239,7 @@ class LocalSession {
         });
         // --- Instantiate game + squisher ---
         try {
-            // Same option bag child_game_server passes; platform services are
-            // stubbed in local mode. addAsset and saveGame/saveData are real:
+            // Same option bag child_game_server passes. addAsset and saveGame/saveData are real:
             // uploads render locally and saves persist in browser storage.
             this.game = new this.gameClass({
                 createExport: this.userExportsStore.createExport,
@@ -249,7 +251,6 @@ class LocalSession {
                     && this.setCursor(playerId, cursor),
                 saveGame,
                 saveData,
-                services: {},
             });
             // The runtime owns ticking; Squish owns scene serialization.
             // Frameless: no custom layers, scale 1.

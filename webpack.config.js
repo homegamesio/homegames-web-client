@@ -1,5 +1,6 @@
 const path = require('path');
 const webpack = require('webpack');
+const LicenseNoticesPlugin = require('./tools/license-notices-plugin.cjs');
 
 module.exports = {
     entry: path.join(__dirname, 'src', 'index.js'),
@@ -24,6 +25,7 @@ module.exports = {
         }
     },
     plugins: [
+        new LicenseNoticesPlugin(),
         // The squish Squisher (used by LocalSession) builds asset bundles with
         // Buffer, which browsers don't have. Resolve the polyfill absolutely —
         // squish is file-linked from outside this package, so relative

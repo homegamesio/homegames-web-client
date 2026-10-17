@@ -17,7 +17,7 @@ const createLocalChrome = (containerId, title, onHome, share = null, options = {
     let dialog;
     if (share) {
         dialog = require('./share-dialog')({ container: frame, ...share });
-        toolbar.setAction('share', { label: 'Share', run: () => dialog.show() });
+        toolbar.setAction('share', { label: 'Invite', run: () => dialog.show() });
         if (share.onVisibility) {
             let privateGame = share.private;
             const update = () => toolbar.setAction('privacy', { label: privateGame ? 'Make session public' : 'Make session private', run: async () => {

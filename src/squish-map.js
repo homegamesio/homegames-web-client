@@ -4,12 +4,9 @@
 // dependency. Requires must stay static so webpack can bundle them.
 
 const squishMap = {
-    '142': require('./codecs/squish-142'),
-    '143': require('./codecs/squish-143'),
-    '145': require('./codecs/squish-145'),
-    '146': require('squish-146')
+    '150': require('squish-150')
 };
 
-const DEFAULT_VERSION = '142';
+const DEFAULT_VERSION = '150';
 
 module.exports = { squishMap, DEFAULT_VERSION };

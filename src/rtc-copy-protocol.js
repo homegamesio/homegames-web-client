@@ -64,7 +64,9 @@ class Receiver {
             if (msg.type !== 'copy-complete' || this.state !== 'receiving' || this.offset !== this.metadata.bytes) throw new Error('Incomplete game copy');
             this.state = 'validating';
             const bytes = this.bytes, metadata = this.metadata;
-            if (await digest(bytes) !== metadata.sha256) throw new Error('The game copy was damaged during transfer. Try again.');
+            const actualDigest = await digest(bytes);
+            if (this.state === 'closed') return;
+            if (actualDigest !== metadata.sha256) throw new Error('The game copy was damaged during transfer. Try again.');
             const project = await this.importArchive(bytes);
             if (project.revision !== metadata.revision || project.manifest.gameId !== metadata.gameId) throw new Error('The received game does not match the offered copy');
             if (this.state === 'closed') return;

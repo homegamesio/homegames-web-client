@@ -120,9 +120,15 @@ class HomegamesClient {
                 playerName: this.playerName,
                 gamepad: this.gamepadOptions, platform: opts.platform, saveStore: this.saveStore,
                 onSaveData: this.onSaveData, onError: this.onError, onReady: id => {
+                    const solo = this._localSession?.maxPlayers === 1;
+                    if (this._shareOptions) this._localChrome?.toolbar?.setAction('share', {
+                        label: solo ? 'Invite (solo)' : 'Invite', disabled: solo,
+                        title: solo ? 'This is a solo game. Use Share a copy to send it to a friend.' : 'Invite friends to play',
+                        run: () => this.showShare(),
+                    });
                     this.onReady(id);
-                    if (this._shareOptions?.autoStart) {
-                        this._getRtcHost().share().catch(err => this._localChrome?.setStatus?.(`Not available to join: ${err.message}. Use Share to retry.`));
+                    if (this._shareOptions?.autoStart && !solo) {
+                        this._getRtcHost().share().catch(err => this._localChrome?.setStatus?.(`Not available to join: ${err.message}. Use Invite to retry.`));
                     }
                 },
             }),

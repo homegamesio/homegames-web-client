@@ -14,6 +14,7 @@ module.exports = {
     create: files => project.createProject(files, options),
     importArchive: bytes => project.importArchive(bytes, options),
     exportArchive: project.exportArchive,
+    withGameId: project.withGameId,
     normalizePath: project.normalizePath,
     limits: project.LIMITS,
     buildIsolatedHtml: html.buildIsolatedHtml,

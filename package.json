@@ -1,6 +1,6 @@
 {
   "name": "homegames-client",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Embeddable browser client for Homegames",
   "main": "src/index.js",
   "browser": "dist/homegames-client.js",
@@ -10,24 +10,30 @@
     "prepack": "npm run build"
   },
   "author": "Joseph Garcia",
-  "license": "GPL-3.0",
+  "license": "MIT",
   "dependencies": {
     "buffer": "^6.0.3",
-    "homegames-common": "1.7.1",
-    "homepad": "0.2.0",
+    "homegames-common": "1.7.3",
+    "homepad": "0.2.1",
     "qrcode-generator": "^2.0.4",
-    "squish-142": "npm:squishjs@1.4.2",
-    "squish-143": "npm:squishjs@1.4.3",
-    "squish-145": "npm:squishjs@1.4.5",
-    "squish-146": "npm:squishjs@1.4.6"
+    "squish-150": "npm:squishjs@1.5.0"
   },
   "devDependencies": {
     "webpack": "^5.65.0",
     "webpack-cli": "^4.3.1"
   },
+  "overrides": {
+    "homepad": "0.2.1",
+    "homegames-common": {
+      "ws": "7.5.13"
+    }
+  },
   "files": [
     "src",
     "dist",
-    "webpack.config.js"
+    "tools/license-notices-plugin.cjs",
+    "notices",
+    "webpack.config.js",
+    "THIRD_PARTY_NOTICES.md"
   ]
 }

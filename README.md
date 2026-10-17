@@ -102,7 +102,7 @@ See [RTC performance and file-transfer notes](../homegames-core/docs/rtc-perform
 
 ## Live microphone and camera
 
-Browser/RTC games receive a `media` service with `request(playerId, { audio, video, transmitting, pushToTalk })`, `setTransmitting(id, bool)`, `stop(id)` and `onChange(listener)`. A successful request returns a stream handle for `new GameNode.Stream({ streamId: handle.id, pos, size, audio: true })`. Stream is a native Squish 1.4.6 node: games using it must import `squish-146` and declare version `146`. Squish serializes its reference and presentation properties; live bytes are carried by native WebRTC tracks. The host forwards guest sources to the other participants.
+Browser/RTC games receive a `media` service with `request(playerId, { audio, video, transmitting, pushToTalk })`, `setTransmitting(id, bool)`, `stop(id)` and `onChange(listener)`. A successful request returns a stream handle for `new GameNode.Stream({ streamId: handle.id, pos, size, audio: true })`. Stream is a native Squish 1.4.6 node: games using it must import `squish-150` and declare version `146`. Squish serializes its reference and presentation properties; live bytes are carried by native WebRTC tracks. The host forwards guest sources to the other participants.
 
 The player's browser owns permission confirmation, capture and a persistent Disconnect control. Push-to-talk is additionally gated locally by a held pointer/touch/Space and releases immediately on cancellation, blur, hiding or detach. Own-source playback stays muted. This version broadcasts to the whole room, is not recorded, and requires browser/RTC play; Core/WebSocket-only requests report that requirement. See [the API contract, Walkie Talkie example and release notes](../homegames-core/docs/live-media.md).
 
@@ -171,18 +171,21 @@ Notes on the build:
 
 ## License
 
-GPL-3.0
+MIT
 
 ## Gamepad support
 
 Homepad reads and normalizes controllers. Homegames delivers those snapshots to the correct player in hosted and local sessions using the same `homegames-common/game-input.js` router. Games never import Homepad.
 
-The simplest integration reuses a game's keyboard handlers:
+The simplest integration reuses a game's keyboard handlers. In a new portable
+game, the Squish import selects the runtime; keep the stable game ID and capacity
+in the class metadata:
 
 ```js
 static metadata() {
     return {
-        name: 'My Game', squishVersion: '142',
+        gameId: 'd05657b1-c5eb-4b4b-82b0-54b59900e61b',
+        name: 'My Game', maxPlayers: 1,
         gamepadBindings: {
             ArrowLeft: ['DIRECTION_LEFT', 'STICK_1_LEFT'],
             ArrowRight: ['DIRECTION_RIGHT', 'STICK_1_RIGHT'],

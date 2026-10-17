@@ -30,6 +30,7 @@ const loadGameClass = ({ files, entryPoint }) => {
     }
 
     const moduleCache = {};
+    const versions = new Set();
 
     const loadModule = (path) => {
         if (moduleCache[path]) return moduleCache[path].exports;
@@ -39,6 +40,8 @@ const loadGameClass = ({ files, entryPoint }) => {
         const requireShim = (request) => {
             const squishMatch = /^squish-(\d+)$/.exec(request);
             if (squishMatch) {
+                versions.add(squishMatch[1]);
+                if (versions.size > 1) throw new Error('Mixed Squish runtimes are unsupported');
                 const squishModule = squishMap[squishMatch[1]];
                 if (squishModule) return squishModule;
                 throw new Error('Unsupported Squish runtime: ' + request);
@@ -82,7 +85,13 @@ const loadGameClass = ({ files, entryPoint }) => {
         throw new Error('Entry point "' + entryPoint + '" not found in game source map');
     }
 
-    return loadModule(entry);
+    const GameClass = loadModule(entry);
+    if (versions.size) {
+        const { normalizeMetadata, bindRuntimeMetadata } = require('homegames-common/runtime-metadata');
+        const metadata = typeof GameClass.metadata === 'function' ? GameClass.metadata() : {};
+        bindRuntimeMetadata(GameClass, normalizeMetadata(metadata, { runtime: [...versions][0], legacy: true }));
+    }
+    return GameClass;
 };
 
 module.exports = { loadGameClass };

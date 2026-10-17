@@ -553,7 +553,7 @@ class InputHandler {
 
     // Whether the game's squish version uses the single-click contract
     // (onClick once per press, mousemove while held, mouseup on release).
-    // Modern version strings are three digits ('142', '144'); anything else
+    // Modern version strings are three digits ('150', '144'); anything else
     // ('0767' / '1000'-style) predates drag support entirely — both get the
     // legacy repeated-click behavior.
     _usesSingleClickContract() {
@@ -662,9 +662,9 @@ class InputHandler {
     _promptFileUpload(nodeId) {
         const inputEl = document.createElement('input');
         inputEl.type = 'file';
-        // The platform understands image, audio and video assets; the squished node
-        // carries no per-node accept info, so this is the global filter.
-        inputEl.accept = 'image/*,audio/*,video/*';
+        // Games also import portable creations such as level packs. The node
+        // has no per-input accept field; each game still validates the bytes.
+        inputEl.accept = 'image/*,audio/*,video/*,application/json,.json';
         inputEl.style.display = 'none';
         document.body.appendChild(inputEl);
         const cleanupInput = () => {
