@@ -183,6 +183,13 @@ class InputHandler {
             // that would normally focus an embedded game. Treat this direct
             // gesture as input focus so the first tap can reach the game too.
             // Page-control touches return above; blur still releases input.
+            // preventDefault also suppresses native focus transfer. Move DOM
+            // focus into the canvas so a later keyboard press cannot activate
+            // the embedding toolbar's previously focused button.
+            if (typeof this.canvas.focus === 'function') {
+                if (this.canvas.tabIndex < 0) this.canvas.tabIndex = -1;
+                this.canvas.focus({ preventScroll: true });
+            }
             this._focused = true;
             this._touchActive = true;
             clearTimeout(this.clickStopper); this.clickStopper = null;
