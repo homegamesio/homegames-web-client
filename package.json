@@ -1,6 +1,6 @@
 {
   "name": "homegames-client",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Embeddable browser client for Homegames",
   "main": "src/index.js",
   "browser": "dist/homegames-client.js",
@@ -13,7 +13,7 @@
   "license": "MIT",
   "dependencies": {
     "buffer": "^6.0.3",
-    "homegames-common": "1.7.7",
+    "homegames-common": "1.7.8",
     "homepad": "0.2.1",
     "qrcode-generator": "^2.0.4",
     "squish-150": "npm:squishjs@1.5.0",
