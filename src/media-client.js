@@ -3,7 +3,7 @@
 const RecordingClient = require('./recording-client');
 class MediaClient {
     constructor({ container, assets, send, platform, publish = () => {}, unpublish = () => {} }) {
-        Object.assign(this, { container, assets, send, publish, unpublish });
+        Object.assign(this, { container, assets, send, platform, publish, unpublish });
         this.streams = new Map(); this.received = new Map(); this.pending = new Map(); this.held = new Set();
         this.recorder = new RecordingClient({ container, send, platform,
             busy: () => this.pending.size || [...this.streams.values()].some(a => a.local) });
@@ -19,6 +19,7 @@ class MediaClient {
         if (this.held.size) return;
         for (const asset of this.streams.values()) if (asset.local && asset.pushToTalk) {
             asset.transmitting = false; asset.data.getTracks().forEach(track => { track.enabled = false; });
+            asset.capture?.setTransmitting(false);
             this.send({ type: 'media', action: 'released', id: asset.id });
         }
         this.assets._notifyReady();
@@ -41,6 +42,7 @@ class MediaClient {
                         this.send({ type: 'media', action: 'released', id: info.id });
                     }
                     existing.data.getTracks().forEach(track => { track.enabled = existing.transmitting; });
+                    existing.capture?.setTransmitting(existing.transmitting);
                 }
             } else this.streams.set(info.id, { ...info, type: 'stream', data: this.received.get(info.sourceId), local: false });
             this.assets._notifyReady();
@@ -56,6 +58,7 @@ class MediaClient {
         if (this.recorder.active || this.pending.size || [...this.streams.values()].some(a => a.local)) {
             this.send({ type: 'media', action: 'result', id: info.id, error: 'A microphone/camera is already active or awaiting permission' }); return;
         }
+        if (this.platform?.captureLive) return this.requestPortable(info);
         const dialog = document.createElement('dialog');
         dialog.setAttribute('aria-label', 'Enable live media');
         dialog.style.cssText = 'margin:auto;padding:24px;max-width:360px;border:1px solid #666;border-radius:16px;background:#202321;color:white;font:16px system-ui';
@@ -91,6 +94,30 @@ class MediaClient {
         };
         dialog.showModal(); start.focus();
     }
+    requestPortable(info) {
+        let capture;
+        try { capture = this.platform.captureLive(info); }
+        catch (error) { this.send({ type: 'media', action: 'result', id: info.id, error: error.message }); return; }
+        this.pending.set(info.id, capture);
+        capture.result.then(stream => {
+            if (this.closed || this.pending.get(info.id) !== capture) { capture.close(); return; }
+            this.pending.delete(info.id);
+            const asset = { ...info, sourceId: stream.id, type: 'stream', data: stream, local: true, capture,
+                transmitting: !!info.transmitting && (!info.pushToTalk || this.held.size > 0) };
+            this.streams.set(info.id, asset);
+            capture.onended = () => this.stopLocal(info.id);
+            capture.onrelease = () => this.release();
+            stream.getTracks().forEach(track => { track.enabled = asset.transmitting; });
+            capture.setTransmitting(asset.transmitting);
+            this.send({ type: 'media', action: 'result', id: info.id, sourceId: stream.id });
+            this.publish(info.id, stream); this.assets._notifyReady();
+            if (asset.pushToTalk && !asset.transmitting) this.send({ type: 'media', action: 'released', id: info.id });
+        }, error => {
+            if (this.pending.get(info.id) !== capture) return;
+            this.pending.delete(info.id);
+            if (!this.closed) this.send({ type: 'media', action: 'result', id: info.id, error: error.message });
+        });
+    }
     showStop() {
         if (this.stopButton) return;
         const button = this.stopButton = document.createElement('button');
@@ -102,10 +129,11 @@ class MediaClient {
     stopLocal(id) { this.remove(id); this.send({ type: 'media', action: 'stopped', id }); }
     remove(id) {
         const dialog = this.pending.get(id);
-        if (dialog) { this.pending.delete(id); dialog.close(); dialog.remove(); }
+        if (dialog) { this.pending.delete(id); dialog.close(); dialog.remove?.(); }
         const asset = this.streams.get(id); this.streams.delete(id);
         if (asset?.local) {
             this.unpublish(id);
+            if (asset.capture) { asset.capture.onended = null; asset.capture.close(); }
             asset.data.getTracks().forEach(track => { track.onended = null; track.stop(); });
             this.stopButton?.remove(); this.stopButton = null;
         }
