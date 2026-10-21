@@ -37,6 +37,8 @@ class InputHandler {
         this.mouseDown = false;
         this.mousePos = null;
         this._pressClickSent = false;
+        this._touchActive = false;
+        this._lastTouchTime = -Infinity;
         this.squishVersion = null;  // set by the session once known (init message / local metadata)
         this._lastClientPos = null;
         this.keysDown = {};
@@ -95,6 +97,7 @@ class InputHandler {
         document.removeEventListener('pointerlockerror', h.pointerlockerror);
 
         h.mousedown = (e) => {
+            if (this._isTouchMouseEvent(e)) return;
             this._pointerLockOnRelease = false;
             if (this._isControlEvent(e)) return;
             // A new physical press must not be swallowed by the previous
@@ -128,6 +131,7 @@ class InputHandler {
         };
 
         h.mouseup = (e) => {
+            if (this._isTouchMouseEvent(e)) return;
             this.assetManager.liveMedia?.release('pointer');
             this.mousePos = this._hasPointerLock() ? this._canvasCenter() : [e.clientX, e.clientY];
             this._lastClientPos = this.mousePos.slice();
@@ -145,6 +149,7 @@ class InputHandler {
         };
 
         h.mousemove = (e) => {
+            if (this._isTouchMouseEvent(e)) return;
             if (this._hasPointerLock()) {
                 if (this.mouseDown && e.buttons === 0) this._releasePointerPress();
                 if (Number.isFinite(e.movementX) && Number.isFinite(e.movementY)) {
@@ -192,6 +197,7 @@ class InputHandler {
             }
             this._focused = true;
             this._touchActive = true;
+            this._lastTouchTime = Date.now();
             clearTimeout(this.clickStopper); this.clickStopper = null;
             this.assetManager.liveMedia?.hold('pointer');
             this.mouseDown = true;
@@ -203,16 +209,23 @@ class InputHandler {
         };
 
         h.touchmove = (e) => {
+            if (!this._touchActive) return;
             e.preventDefault();
+            this._lastTouchTime = Date.now();
             this.mouseDown = true;
             this.mousePos = [e.touches[0].clientX + window.scrollX, e.touches[0].clientY + window.scrollY];
             this._lastClientPos = [e.touches[0].clientX, e.touches[0].clientY];
         };
 
         h.touchend = (e) => {
-            this.assetManager.liveMedia?.release('pointer');
             // Releases of touches we never claimed (page UI taps) aren't ours
             if (!this._touchActive) return;
+            this.assetManager.liveMedia?.release('pointer');
+            this._lastTouchTime = Date.now();
+            // Cancel compatibility mouse events at release as well as start.
+            // Keep this listener non-passive; native file pickers still open
+            // synchronously below, within the touchend activation gesture.
+            if (e.cancelable !== false) e.preventDefault?.();
             // touches is empty by touchend; the lifted finger is in changedTouches.
             const touch = e.changedTouches && e.changedTouches[0];
             if (touch) {
@@ -235,9 +248,12 @@ class InputHandler {
                 this._sendMouseUp(touch.clientX, touch.clientY);
             }
             this.mouseDown = false;
+            this._touchActive = false;
         };
 
         h.touchcancel = () => {
+            if (!this._touchActive) return;
+            this._lastTouchTime = Date.now();
             this.assetManager.liveMedia?.release('pointer');
             // Touch was taken over by the OS (gesture, notification shade) —
             // report the release at the last known position so the server can
@@ -246,6 +262,7 @@ class InputHandler {
                 this._sendMouseUp(this._lastClientPos[0], this._lastClientPos[1], true);
             }
             this.mouseDown = false;
+            this._touchActive = false;
         };
 
         h.keydown = (e) => {
@@ -348,7 +365,7 @@ class InputHandler {
         document.addEventListener('pointerlockerror', h.pointerlockerror);
         window.addEventListener('touchstart', h.touchstart, { passive: false });
         this.canvas.addEventListener('touchmove', h.touchmove, { passive: false });
-        window.addEventListener('touchend', h.touchend);
+        window.addEventListener('touchend', h.touchend, { passive: false });
         window.addEventListener('touchcancel', h.touchcancel);
         document.addEventListener('keydown', h.keydown);
         document.addEventListener('keyup', h.keyup);
@@ -491,6 +508,7 @@ class InputHandler {
         this.assetManager.liveMedia?.release('pointer');
         if (this.mouseDown && this._lastClientPos) this._sendMouseUp(...this._lastClientPos, true);
         this.mouseDown = false;
+        this._touchActive = false;
         this._pressClickSent = false;
         this.mousePos = null;
         this._lastClientPos = null;
@@ -528,6 +546,19 @@ class InputHandler {
 
     _isControlEvent(event) {
         return !!event.target?.closest?.('button, a, input, select, textarea, [contenteditable="true"]');
+    }
+
+    _isTouchMouseEvent(event) {
+        // One touch is already one game press. Some mobile browsers also
+        // deliver compatibility mouse events on release, toggling buttons a
+        // second time. Safari does not expose sourceCapabilities, so retain a
+        // short, canvas-only fallback after our own touch gestures. Explicit
+        // physical mouse input and the embedding page's controls stay usable.
+        const fromTouch = event.sourceCapabilities?.firesTouchEvents;
+        if (fromTouch === true) return true;
+        if (fromTouch === false) return false;
+        return event.target === this.canvas &&
+            (this._touchActive || Date.now() - this._lastTouchTime < 800);
     }
 
     _keyMatters(event) {
@@ -720,13 +751,11 @@ class InputHandler {
         inputEl.click();
     }
 
-    _translateX(x) {
-        const rect = this.canvas.getBoundingClientRect();
+    _translateX(x, rect = this.canvas.getBoundingClientRect()) {
         return (x * rect.width / 100) + rect.left;
     }
 
-    _translateY(y) {
-        const rect = this.canvas.getBoundingClientRect();
+    _translateY(y, rect = this.canvas.getBoundingClientRect()) {
         return (y * rect.height / 100) + rect.top;
     }
 
@@ -739,10 +768,16 @@ class InputHandler {
         const rect = this.canvas.getBoundingClientRect();
         if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return { isClickable, isHoverable, action, nodeId };
 
+        // One geometry read covers the whole hit test, including every polygon
+        // vertex. Keep pixel-space arithmetic and drawing-order occlusion.
         const thingIndices = this.getThingIndices();
 
-        for (const chunkIndex in thingIndices) {
+        // The last containing node wins, including non-interactive shapes
+        // that occlude controls. Search from the top so obscured lower nodes
+        // need no geometry work once the same winner has been found.
+        for (let chunkIndex = thingIndices.length - 1; chunkIndex >= 0; chunkIndex--) {
             const chunk = thingIndices[chunkIndex];
+            if (!chunk) continue;
             let vertices = chunk[3];
             if (!vertices || !vertices.length) continue;
 
@@ -757,14 +792,14 @@ class InputHandler {
 
             // Point-in-polygon
             let inside = false;
-            let minX = this._translateX(vertices[0][0]);
+            let minX = this._translateX(vertices[0][0], rect);
             let maxX = minX;
-            let minY = this._translateY(vertices[0][1]);
+            let minY = this._translateY(vertices[0][1], rect);
             let maxY = minY;
 
             for (let i = 1; i < vertices.length; i++) {
-                const vx = this._translateX(vertices[i][0]);
-                const vy = this._translateY(vertices[i][1]);
+                const vx = this._translateX(vertices[i][0], rect);
+                const vy = this._translateY(vertices[i][1], rect);
                 if (vx < minX) minX = vx;
                 if (vx > maxX) maxX = vx;
                 if (vy < minY) minY = vy;
@@ -774,10 +809,10 @@ class InputHandler {
             if (!(x < minX || x > maxX || y < minY || y > maxY)) {
                 let i = 0, j = vertices.length - 1;
                 for (; i < vertices.length; j = i++) {
-                    const yi = this._translateY(vertices[i][1]);
-                    const yj = this._translateY(vertices[j][1]);
-                    const xi = this._translateX(vertices[i][0]);
-                    const xj = this._translateX(vertices[j][0]);
+                    const yi = this._translateY(vertices[i][1], rect);
+                    const yj = this._translateY(vertices[j][1], rect);
+                    const xi = this._translateX(vertices[i][0], rect);
+                    const xj = this._translateX(vertices[j][0], rect);
                     if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) {
                         inside = !inside;
                     }
@@ -789,6 +824,7 @@ class InputHandler {
                 action = chunk[1];
                 nodeId = chunk[2];
                 isHoverable = !!chunk[4];
+                break;
             }
         }
 

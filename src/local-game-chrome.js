@@ -14,10 +14,20 @@ const createLocalChrome = (containerId, title, onHome, share = null, options = {
     const gameArea = document.createElement('div'); gameArea.className = 'hg-session-game';
     gameArea.id = `${containerId}-hg-local-area`;
     frame.append(toolbar.bar, gameArea); container.append(frame);
-    let dialog;
+    gameArea.homegamesToolbar = toolbar;
+    toolbar.setGameArea(gameArea, frame);
+    let sharing;
     if (share) {
-        dialog = require('./share-dialog')({ container: frame, ...share });
-        toolbar.setAction('share', { label: 'Invite', run: () => dialog.show() });
+        if (!share.getSharingLink) sharing = require('./player-sharing')({
+            ...share, getInvitation: share.getLink,
+            onStatus: (text, mode) => toolbar.setSharingStatus(text, mode),
+        });
+        toolbar.setSharing({
+            multiplayer: share.multiplayer !== false,
+            copy: !!(share.getSharingLink || share.getProject),
+            getLink: share.getSharingLink || (mode => sharing.getLink(mode)),
+            dispose: sharing ? () => sharing.dispose() : undefined,
+        });
         if (share.onVisibility) {
             let privateGame = share.private;
             const update = () => toolbar.setAction('privacy', { label: privateGame ? 'Make session public' : 'Make session private', run: async () => {
@@ -27,8 +37,8 @@ const createLocalChrome = (containerId, title, onHome, share = null, options = {
     }
     let disposed = false;
     return { bar: toolbar.bar, toolbar, gameArea, containerId: gameArea.id,
-        setStatus: text => toolbar.setStatus(text),
-        dispose() { if (disposed) return; disposed = true; dialog?.dispose(); toolbar.dispose(); frame.remove(); releaseStyles(); },
+        setStatus: (text, details) => toolbar.setStatus(text, details),
+        dispose() { if (disposed) return; disposed = true; sharing?.dispose(); toolbar.dispose(); frame.remove(); releaseStyles(); },
     };
 };
 createLocalChrome.addExportsButton = (bar, onExports) => {

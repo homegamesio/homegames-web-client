@@ -3,6 +3,7 @@ const SessionController = require('./session-controller');
 const createLocalChrome = require('./local-game-chrome');
 const { loadLocalGame, loadHomeGame } = require('./local-game-loader');
 const { GameView, FrameLoop, getClientInfo } = require('./game-view');
+const createPlayerSharing = require('./player-sharing');
 /**
  * HomegamesClient — Embeddable game client for Homegames.
  *
@@ -38,6 +39,8 @@ class HomegamesClient {
      * @param {function} [opts.onReady] — callback(playerId) when session is ready
      * @param {function} [opts.onClose] — callback when WebSocket closes
      * @param {function} [opts.onError] — callback(error) on error
+     * @param {function} [opts.onAspectRatio] — callback({ x, y }) when the game
+     *        aspect ratio changes, for an embedding player's frame.
      * @param {boolean} [opts.spectating] — connect as spectator (default false)
      * @param {object} [opts.requestedGame] — { gameId, versionId } to request
      * @param {function} [opts.onLocalPlayRedirect] — callback({ gameKey, versionId })
@@ -62,8 +65,20 @@ class HomegamesClient {
         this.transportFactory = opts.transport || null;
         this.transport = null;
         this.onReady = opts.onReady || (() => {});
-        this.onClose = opts.onClose || (() => {});
-        this.onError = opts.onError || (() => {});
+        this.onClose = () => {
+            // A failed join often emits error and then close. Keep the useful
+            // failure reason (and any host-supplied recovery instructions).
+            if (!this._connectionFailed) this._setFrameStatus('Disconnected from the game.', { attention: true });
+            opts.onClose?.();
+        };
+        this.onError = error => {
+            this._connectionFailed = true;
+            this._setFrameStatus(error?.message || 'Unable to connect to the game.', { attention: true });
+            opts.onError?.(error);
+        };
+        this.onAspectRatio = opts.onAspectRatio || (() => {});
+        this.onSharingStatus = opts.onSharingStatus || (() => {});
+        this._toolbarSharingLink = mode => this.getSharingLink(mode);
         this.onSaveData = opts.onSaveData || (() => {});
         this.onLocalPlayRedirect = opts.onLocalPlayRedirect || null;
         this.spectating = opts.spectating || false;
@@ -75,6 +90,7 @@ class HomegamesClient {
         this.saveStore = opts.saveStore || createSaveStore();
 
         this.platform = opts.platform;
+        this._defaultShareOptions = opts.share && typeof opts.share === 'object' ? opts.share : null;
         this._playerProfile = require('homegames-common/player-identity').profile(window);
         this.playerName = opts.playerName === undefined ? this._playerProfile.get() : this._playerProfile.set(opts.playerName);
         this.showChrome = opts.chrome !== false;
@@ -106,7 +122,7 @@ class HomegamesClient {
                 if (!this.showChrome) return { containerId: this.containerId, dispose() {} };
                 const chrome = createLocalChrome(this.containerId, game.name || game.gameKey,
                 opts.localHome === false ? null : typeof opts.localHome === 'string' ? opts.localHome : () => this.exitLocalGame(), this._shareOptions ? {
-                    getLink: () => this._getRtcHost().share(),
+                    getSharingLink: this._toolbarSharingLink,
                     private: this._shareOptions.visibility !== 'public',
                     onVisibility: this._shareOptions.room ? visibility => this._getRtcHost().setVisibility(visibility) : null,
                     onOpen: () => this._localSession?.inputHandler?.detach(),
@@ -119,13 +135,10 @@ class HomegamesClient {
             createLocal: game => new LocalSession({ ...game,
                 playerName: this.playerName,
                 gamepad: this.gamepadOptions, platform: opts.platform, saveStore: this.saveStore,
+                onAspectRatio: this.onAspectRatio,
                 onSaveData: this.onSaveData, onError: this.onError, onReady: id => {
                     const solo = this._localSession?.maxPlayers === 1;
-                    if (this._shareOptions) this._localChrome?.toolbar?.setAction('share', {
-                        label: solo ? 'Invite (solo)' : 'Invite', disabled: solo,
-                        title: solo ? 'This is a solo game. Use Share a copy to send it to a friend.' : 'Invite friends to play',
-                        run: () => this.showShare(),
-                    });
+                    this._configureSharing(this._localChrome?.toolbar);
                     this.onReady(id);
                     if (this._shareOptions?.autoStart && !solo) {
                         this._getRtcHost().share().catch(err => this._localChrome?.setStatus?.(`Not available to join: ${err.message}. Use Invite to retry.`));
@@ -141,6 +154,7 @@ class HomegamesClient {
      */
     start() { this._sessions.start(); }
     stop() {
+        this.disposeSharing();
         this._shareDialog?.dispose(); this._shareDialog = null;
         if (!this._switchingManual) { this._manualPairing?.dispose(); this._manualPairing = null; }
         this._sessions.stop();
@@ -208,9 +222,56 @@ class HomegamesClient {
         throw new Error('This session is not available to share');
     }
 
+    // Both the direct menu and an opaque iframe host use the same invitation
+    // and copy provider. Keep copy invitations valid while this game is open.
+    getSharingLink(mode) {
+        if (!this._localSession && !this.view) return Promise.reject(new Error('The game is still loading. Try again once it is ready.'));
+        if (!this._playerSharing) this._playerSharing = createPlayerSharing({
+            ...this._shareOptions,
+            getInvitation: () => this.getShareLink(),
+            getProject: async () => (await this.requestGameCopy()).project,
+            onStatus: (text, sharingMode = 'copy') => {
+                this._playerToolbar()?.setSharingStatus?.(text, sharingMode);
+                this.onSharingStatus(text, sharingMode);
+            },
+        });
+        return this._playerSharing.getLink(mode);
+    }
+
+    disposeSharing() {
+        this._playerSharing?.dispose();
+        this._playerSharing = null;
+    }
+
+    _configureSharing(toolbar) {
+        if (!toolbar) return;
+        if (!this._shareOptions && !this.transport?.getShareLink) {
+            toolbar.setSharing?.(null);
+            return;
+        }
+        toolbar.setSharing({
+            multiplayer: this._localSession?.maxPlayers !== 1,
+            getLink: this._toolbarSharingLink,
+        });
+    }
+
     setInputEnabled(enabled) {
         const input = this._localSession?.inputHandler || this.inputHandler;
-        if (enabled) input?.attach(); else input?.detach();
+        if (enabled) {
+            input?.attach();
+            // Native dialogs restore focus to their launch button. Return it
+            // to the game so keyboard play resumes immediately as well.
+            input?.canvas.focus?.({ preventScroll: true });
+        } else input?.detach();
+    }
+
+    _playerToolbar() {
+        return this._sessions?.chrome?.toolbar || this._remoteChrome?.toolbar
+            || this.container?.closest?.('.hg-session-frame')?.querySelector?.('.hg-session-bar')?.homegamesToolbar;
+    }
+
+    _setFrameStatus(text, details) {
+        this._playerToolbar()?.setStatus(text, details);
     }
 
     getPlayerName() { return this.playerName; }
@@ -248,6 +309,8 @@ class HomegamesClient {
     get rendering() { return this._loop.running; }
 
     _startRemote() {
+        this._connectionFailed = false;
+        this._shareOptions = this._defaultShareOptions;
         let container = document.getElementById(this.containerId);
         if (!container) {
             this.onError(new Error('Container element not found: #' + this.containerId));
@@ -268,6 +331,11 @@ class HomegamesClient {
             container, send: msg => this._send(msg),
             gamepad: this.gamepadOptions,
             onAssetReady: () => { this._frameDirty = true; this.view?.refreshCursor(); },
+            onLayout: aspectRatio => {
+                this.platform?.setState?.({ aspectRatio });
+                this.onAspectRatio(aspectRatio);
+            },
+            onResize: () => { this._frameDirty = true; },
         });
 
         // --- Handle resize ---
@@ -308,6 +376,8 @@ class HomegamesClient {
      * Disconnect and clean up everything.
      */
     _stopRemote() {
+        this._playerToolbar()?.setSharing?.(null);
+        this.disposeSharing();
         this._exportsViewer?.close();
         this.platform?.closeExports?.();
         this._removeExportsButton?.(); this._removeExportsButton = null;
@@ -460,6 +530,9 @@ class HomegamesClient {
     // -----------------------------------------------------------------------
 
     _reconnect(newWsUrl) {
+        this._playerToolbar()?.setSharing?.(null);
+        this.disposeSharing();
+        this._connectionFailed = false;
         this._exportsViewer?.close(); this.platform?.closeExports?.();
         this._projectTransfer?.close(); this._projectTransfer = null;
         this.wsUrl = newWsUrl;
@@ -685,6 +758,9 @@ class HomegamesClient {
         }
 
         this._initCanvas();
+        this._connectionFailed = false;
+        this._setFrameStatus('Connected game', { attention: false });
+        this._configureSharing(this._playerToolbar());
         this.onReady(this.playerId);
     }
 
@@ -753,6 +829,7 @@ HomegamesClient.createRtcTransport = createRtcTransport;
 HomegamesClient.readInvitation = readInvitation;
 HomegamesClient.RtcHost = RtcHost;
 HomegamesClient.createShareDialog = require('./share-dialog');
+HomegamesClient.createPlayerSharing = createPlayerSharing;
 HomegamesClient.GameCopies = require('./rtc-copy');
 HomegamesClient.createSessionFrame = createLocalChrome;
 HomegamesClient.createPlayerToolbar = require('homegames-common/player-toolbar').createPlayerToolbar;

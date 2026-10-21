@@ -6,17 +6,21 @@ const InputHandler = require('./input');
 // sessions own game state and feed frames into this view. Extra Studio views
 // borrow the primary asset store, and therefore must not dispose that store.
 class GameView {
-    constructor({ container, assetManager, send, gamepad, onAssetReady }) {
+    constructor({ container, assetManager, send, gamepad, onAssetReady, onLayout, onResize }) {
         this.container = container;
+        this.onLayout = onLayout;
+        this.onResize = onResize;
         container.innerHTML = '';
-        Object.assign(container.style, { position: 'relative', overflow: 'hidden', background: '#000' });
+        Object.assign(container.style, { position: container.style.position || 'relative', overflow: 'hidden', background: '#000' });
         this.canvas = document.createElement('canvas');
+        this.canvas.tabIndex = -1;
         Object.assign(this.canvas.style, {
-            display: 'block', margin: '0 auto', cursor: 'default',
+            display: 'block', position: 'absolute', margin: '0', cursor: 'default',
             // Keep iOS tap highlights and long-press selection off the game surface.
             webkitTapHighlightColor: 'transparent',
             webkitTouchCallout: 'none',
             webkitUserSelect: 'none', userSelect: 'none',
+            touchAction: 'none',
         });
         this.cursor = null;
         this.cursorOverride = null;
@@ -29,6 +33,14 @@ class GameView {
         this.inputHandler = new InputHandler(this.canvas, send,
             () => this.renderer.thingIndices, this.assetManager, gamepad);
         this.inputHandler.attach();
+        // Embedders can resize a preview or reserve space for its Homegames
+        // button without resizing the browser window.
+        if (window.ResizeObserver) {
+            this._resizeObserver = new window.ResizeObserver(() => {
+                if (this.aspectRatio && !this.destroyed) this.resize(this.aspectRatio);
+            });
+            this._resizeObserver.observe(container);
+        }
     }
 
     // Cursor selection belongs to the session/player, independently of hover.
@@ -104,22 +116,41 @@ class GameView {
     }
 
     resize(aspectRatio) {
+        if (this.destroyed || !Number.isFinite(aspectRatio?.x) || !Number.isFinite(aspectRatio?.y)
+            || aspectRatio.x <= 0 || aspectRatio.y <= 0) return;
+        const aspectChanged = this.aspectRatio?.x !== aspectRatio.x || this.aspectRatio?.y !== aspectRatio.y;
+        this.aspectRatio = { x: aspectRatio.x, y: aspectRatio.y };
+        // The frame owns the available viewport; settle its placement before
+        // fitting the canvas. An iframe host receives the same ratio through
+        // onLayout and will resize this container when its frame changes.
+        const toolbar = this.container.homegamesToolbar
+            || this.container.closest?.('.hg-session-frame')?.querySelector?.('.hg-session-bar')?.homegamesToolbar;
+        toolbar?.setAspectRatio?.(this.aspectRatio);
+        if (aspectChanged) this.onLayout?.({ ...this.aspectRatio });
+        if (this.destroyed) return;
         const maxWidth = this.container.clientWidth || window.innerWidth;
         const maxHeight = this.container.clientHeight || window.innerHeight;
         const fitHeight = maxWidth * aspectRatio.y / aspectRatio.x <= maxHeight;
         const width = fitHeight ? maxWidth : Math.floor(maxHeight * aspectRatio.x / aspectRatio.y);
         const height = fitHeight ? Math.floor(maxWidth * aspectRatio.y / aspectRatio.x) : maxHeight;
-        this.canvas.width = width * 2;
-        this.canvas.height = height * 2;
+        const changed = this.canvas.width !== width * 2 || this.canvas.height !== height * 2;
+        if (changed) {
+            this.canvas.width = width * 2;
+            this.canvas.height = height * 2;
+        }
         this.canvas.style.width = width + 'px';
         this.canvas.style.height = height + 'px';
+        this.canvas.style.left = Math.floor((maxWidth - width) / 2) + 'px';
+        this.canvas.style.top = Math.floor((maxHeight - height) / 2) + 'px';
         this.inputHandler.clientWidth = width;
         this.inputHandler.clientHeight = height;
+        if (changed) this.onResize?.();
     }
 
     destroy() {
         if (this.destroyed) return;
         this.destroyed = true;
+        this._resizeObserver?.disconnect();
         this.cursor = null;
         this.cursorOverride = null;
         this._cursorRaster = null;

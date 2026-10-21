@@ -86,6 +86,7 @@ class LocalSession {
         this.assetPackets = this.assetBundle ? splitAssetBundle(this.assetBundle) : [];
         this.onReady = opts.onReady || (() => {});
         this.onError = opts.onError || (() => {});
+        this.onAspectRatio = opts.onAspectRatio || (() => {});
         this.gameKey = opts.gameKey || null;
         this.versionId = opts.versionId || DEFAULT_VERSION_ID;
         this.onSaveData = opts.onSaveData || null;
@@ -472,6 +473,15 @@ class LocalSession {
                 dispatcher.handleMessage(msg);
             },
             onAssetReady: () => this._invalidateFrames(),
+            onLayout: aspectRatio => {
+                if (playerId !== this.playerId) return;
+                this.platform?.setState?.({ aspectRatio });
+                this.onAspectRatio(aspectRatio);
+            },
+            onResize: () => {
+                this._invalidateFrames();
+                if (this._inspectBuf) this._paintInspectedFrame();
+            },
         });
         this.players.push({ playerId, info: { name: playerName }, settings: { SOUND: true }, view, dispatcher, cursor: null, currentBuf: null, frameDirty: true });
         if (playerId === this.playerId) {

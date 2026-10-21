@@ -8,7 +8,7 @@ module.exports = () => {
         style.textContent = `
             .hg-session-frame, .hg-share-dialog { font:14px/1.4 system-ui,-apple-system,BlinkMacSystemFont,sans-serif; color:#f6f6ee; }
             .hg-session-frame *, .hg-share-dialog * { box-sizing:border-box; }
-            .hg-session-frame { width:100%; height:100%; display:flex; flex-direction:column; background:#101211; container-type:inline-size; }
+            .hg-session-frame { width:100%; height:100%; position:relative; overflow:hidden; background:#000; container-type:inline-size; }
             .hg-session-game { flex:1; min-height:0; width:100%; position:relative; overflow:hidden; display:flex; align-items:center; background:#000; }
             .hg-share-dialog button { display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:44px; padding:0 18px; border:1px solid #4a5049; border-radius:10px; background:transparent; color:#f6f6ee; font:600 14px/1.2 system-ui,sans-serif; cursor:pointer; }
             .hg-share-dialog .hg-share-copy { background:#fff78e; color:#22261e; }

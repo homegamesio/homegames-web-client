@@ -37,6 +37,12 @@ class Renderer {
         this.thingIndices = [];
 
         let i = 0;
+        // A native canvas ignores shadowColor = null, strokeStyle = null and
+        // lineWidth = 0. Avoid those no-op assignments, and only reset the two
+        // states that actually change. Start unknown because an embed may use
+        // the context between frames (or resizing may reset it).
+        let shadowBlurReset = false;
+        let globalAlphaReset = false;
 
         while (buf && i < buf.length) {
             const frameType = buf[i];
@@ -44,7 +50,11 @@ class Renderer {
 
             let thing;
             try {
-                thing = unsquish(buf.slice(i, i + frameSize)).node;
+                // Decoders read the node bytes synchronously. A typed view
+                // avoids copying every node of every snapshot before decode;
+                // ordinary arrays remain supported by existing embeds.
+                thing = unsquish(typeof buf.subarray === 'function'
+                    ? buf.subarray(i, i + frameSize) : buf.slice(i, i + frameSize)).node;
             } catch (e) {
                 i += frameSize;
                 continue;
@@ -85,10 +95,16 @@ class Renderer {
                 if (thing.effects && thing.effects.shadow) {
                     const sc = thing.effects.shadow.color;
                     ctx.shadowColor = 'rgba(' + sc[0] + ',' + sc[1] + ',' + sc[2] + ',' + sc[3] + ')';
-                    if (thing.effects.shadow.blur) ctx.shadowBlur = thing.effects.shadow.blur;
+                    if (thing.effects.shadow.blur) {
+                        ctx.shadowBlur = thing.effects.shadow.blur;
+                        shadowBlurReset = false;
+                    }
                 }
 
-                if (thing.color) ctx.globalAlpha = thing.color[3] / 255;
+                if (thing.color) {
+                    ctx.globalAlpha = thing.color[3] / 255;
+                    globalAlphaReset = false;
+                }
 
                 if (thing.fill !== null && thing.fill !== undefined) {
                     ctx.fillStyle = 'rgba(' + thing.fill[0] + ',' + thing.fill[1] + ',' + thing.fill[2] + ',' + thing.fill[3] + ')';
@@ -110,15 +126,16 @@ class Renderer {
                 if (thing.fill !== undefined && thing.fill !== null) ctx.fill();
                 if (thing.border !== undefined && thing.border !== null) ctx.stroke();
 
-                ctx.shadowColor = null;
-                ctx.shadowBlur = 0;
-                ctx.lineWidth = 0;
-                ctx.strokeStyle = null;
+                if (!shadowBlurReset) {
+                    ctx.shadowBlur = 0;
+                    shadowBlurReset = true;
+                }
             }
 
             // --- Text ---
             if (thing.text) {
                 ctx.globalAlpha = thing.text.color[3] / 255;
+                globalAlphaReset = false;
                 ctx.fillStyle = 'rgba(' + thing.text.color[0] + ',' + thing.text.color[1] + ',' + thing.text.color[2] + ',' + thing.text.color[3] + ')';
                 const maxTextSize = Math.floor(canvas.width);
                 const fontSize = (thing.text.size / 100) * maxTextSize;
@@ -178,7 +195,10 @@ class Renderer {
                         if (thing.effects && thing.effects.shadow) {
                             const sc = thing.effects.shadow.color;
                             ctx.shadowColor = 'rgba(' + sc[0] + ',' + sc[1] + ',' + sc[2] + ',' + sc[3] + ')';
-                            if (thing.effects.shadow.blur) ctx.shadowBlur = thing.effects.shadow.blur;
+                            if (thing.effects.shadow.blur) {
+                                ctx.shadowBlur = thing.effects.shadow.blur;
+                                shadowBlurReset = false;
+                            }
                         }
 
                         const dx = (asset.pos.x / 100) * canvas.width;
@@ -227,11 +247,14 @@ class Renderer {
             }
 
             i += frameSize;
-            ctx.shadowColor = null;
-            ctx.shadowBlur = 0;
-            ctx.lineWidth = 0;
-            ctx.strokeStyle = null;
-            ctx.globalAlpha = 1;
+            if (!shadowBlurReset) {
+                ctx.shadowBlur = 0;
+                shadowBlurReset = true;
+            }
+            if (!globalAlphaReset) {
+                ctx.globalAlpha = 1;
+                globalAlphaReset = true;
+            }
         }
 
         for (const [id, player] of this.videos) {

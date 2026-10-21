@@ -20,6 +20,7 @@ module.exports = {
     buildIsolatedHtml: html.buildIsolatedHtml,
     runtimeDocument: html.runtimeDocument,
     createFrame: html.createFrame,
+    attachArchiveHost: html.attachArchiveHost,
     attachSaveHost: saves.attachSaveHost,
     attachPlayerHost: (window, frame, settings) => {
         const savesHost = saves.attachSaveHost(window, frame, settings);
